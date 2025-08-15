@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+
+# Environment & credentials
+.env
+*.env
+service-account.json
+*.pem
+*.key
+*.crt
+
+# Logs
+*.log
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Temporary / uploads
+uploads/
+tmp/
+*.pdf
+*.txt
+
+# PyInstaller
+*.spec
+
+# Test / coverage
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+.cache/
+
+# Jupyter
+.ipynb_checkpoints
