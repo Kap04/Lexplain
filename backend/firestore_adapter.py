@@ -36,4 +36,20 @@ def get_summary_by_doc_id(doc_id: str):
     return None
 
 def get_chunks_by_doc_id(doc_id: str):
-    return [doc.to_dict() for doc in db.collection(COLLECTION_CHUNKS).where("documentId", "==", doc_id).stream()]
+    """
+    Retrieve all chunks for a given document ID.
+    Each chunk contains both the original text and the embedding.
+    """
+    chunks = []
+    docs = db.collection(COLLECTION_CHUNKS).where("documentId", "==", doc_id).stream()
+
+    for doc in docs:
+        data = doc.to_dict()
+        chunks.append({
+            "chunkId": doc.id,
+            "text": data.get("text"),           # human-readable chunk text
+            "embedding": data.get("embedding"), # vector for similarity search
+            "metadata": data.get("metadata", {}) # optional, e.g., page number
+        })
+    
+    return chunks

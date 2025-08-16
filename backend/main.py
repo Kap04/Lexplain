@@ -1,281 +1,29 @@
-# --- PDF Content Extraction Helpers (PyMuPDF) ---
-import base64
-import binascii
-import fitz  # PyMuPDF
-import io
-from typing import List, Dict, Any, Tuple
-
-def _strip_data_url(s: str) -> str:
-    if not isinstance(s, str):
-        return s
-    if ',' in s and s.startswith('data:'):
-        return s.split(',', 1)[1]
-    return s
-
-def looks_like_base64(s: str) -> bool:
-    if not isinstance(s, str) or len(s) < 100:
-        return False
-    s = s.strip()
-    try:
-        base64.b64decode(s, validate=True)
-        return True
-    except (binascii.Error, ValueError):
-        return False
-
-def looks_like_pdf_bytes_string(s: str) -> bool:
-    if not isinstance(s, str):
-        return False
-    return s.startswith('%PDF-') or '%PDF-' in s[:1024]
-
-def _short(s, n=240):
-    try:
-        return s[:n]
-    except Exception:
-        return str(s)[:n]
-
-# Debug-heavy version of extraction helper
-
-def extract_pages_from_pdf_content_debug(content) -> Tuple[List[Dict[str,Any]], Dict[str,Any]]:
-    """
-    Robust attempts to decode PDF-like content and extract pages via PyMuPDF.
-    Returns (pages, diag). pages is list of {"page": n, "text": ...}
-    diag contains debug info.
-    """
-    diag = {
-        "input_type": type(content).__name__,
-        "input_len": None,
-        "prefix": None,
-        "attempts": []
-    }
-    pages = []
-    if content is None:
-        raise ValueError("Empty content")
-    try:
-        if isinstance(content, (bytes, bytearray)):
-            diag["input_len"] = len(content)
-            diag["prefix"] = _short(repr(content[:120]))
-        else:
-            s_preview = str(content)[:1024]
-            diag["input_len"] = len(s_preview)
-            diag["prefix"] = _short(s_preview)
-    except Exception as e:
-        diag["prefix_error"] = str(e)
-
-    candidates = []
-    if isinstance(content, (bytes, bytearray)):
-        candidates.append(("bytes_direct", bytes(content)))
-
-    if isinstance(content, str):
-        s = content.strip()
-        if ',' in s and s.startswith('data:'):
-            s = s.split(',', 1)[1]
-            diag["attempts"].append({"note": "stripped data URL prefix"})
-        diag["stripped_prefix"] = _short(s[:1024])
-        try:
-            b = base64.b64decode(s, validate=False)
-            candidates.append(("base64_validate_false", b))
-            diag["attempts"].append({"base64_validate_false_len": len(b)})
-        except Exception as e:
-            diag["attempts"].append({"base64_validate_false_error": str(e)})
-        try:
-            b = base64.b64decode(s, validate=True)
-            candidates.append(("base64_validate_true", b))
-            diag["attempts"].append({"base64_validate_true_len": len(b)})
-        except Exception as e:
-            diag["attempts"].append({"base64_validate_true_error": str(e)})
-        if s.startswith("%PDF-") or "%PDF-" in s[:1024]:
-            try:
-                b = s.encode("utf-8", errors="ignore")
-                candidates.append(("utf8_encoded_from_pdf_string", b))
-                diag["attempts"].append({"utf8_encoded_from_pdf_string_len": len(b)})
-            except Exception as e:
-                diag["attempts"].append({"utf8_encode_error": str(e)})
-        try:
-            b = s.encode("utf-8", errors="surrogateescape")
-            candidates.append(("utf8_surrogateescape", b))
-            diag["attempts"].append({"utf8_surrogateescape_len": len(b)})
-        except Exception as e:
-            diag["attempts"].append({"utf8_surrogateescape_error": str(e)})
-        try:
-            if os.path.exists(s) and os.path.isfile(s):
-                with open(s, "rb") as f:
-                    b = f.read()
-                candidates.append(("file_path_read", b))
-                diag["attempts"].append({"file_path_read_len": len(b)})
-        except Exception as e:
-            diag["attempts"].append({"file_path_read_error": str(e)})
-    if isinstance(content, (list, tuple)) and all(isinstance(x, int) for x in content):
-        try:
-            b = bytes(content)
-            candidates.append(("list_of_ints_bytes", b))
-            diag["attempts"].append({"list_of_ints_len": len(b)})
-        except Exception as e:
-            diag["attempts"].append({"list_of_ints_error": str(e)})
-
-    seen = set()
-    deduped = []
-    for name, b in candidates:
-        key = (len(b), b[:16])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((name, b))
-    candidates = deduped
-
-    last_exc = None
-    for name, pdf_bytes in candidates:
-        try:
-            diag["last_attempt"] = name
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                if doc.is_encrypted:
-                    try:
-                        doc.authenticate("")
-                    except Exception:
-                        raise ValueError("PDF is encrypted")
-                for i in range(len(doc)):
-                    p = doc[i]
-                    page_text = p.get_text("text") or p.get_text("blocks") or p.get_text("dict") or ""
-                    pages.append({"page": i+1, "text": page_text})
-                diag["success_candidate"] = name
-                diag["pages_extracted"] = len(pages)
-                doc.close()
-                break
-            finally:
-                try:
-                    doc.close()
-                except:
-                    pass
-        except Exception as e:
-            last_exc = e
-            diag.setdefault("fitz_errors", []).append({ "candidate": name, "error": repr(str(e)), "short": _short(str(e),180) })
-    if not pages:
-        diag["error"] = "No readable pages produced"
-        if last_exc:
-            diag["last_fitz_error"] = repr(str(last_exc))
-        raise ValueError(f"No readable PDF pages found. diag: {diag}")
-    total_len = sum(len(p["text"].strip()) for p in pages)
-    diag["total_text_chars"] = total_len
-    if total_len < 10:
-        diag["warning"] = "Extracted text extremely short (<10 chars) - likely scanned PDF or OCR required"
-    return pages, diag
-
-def extract_pages_from_pdf_content(content) -> List[Dict[str, Any]]:
-    """Resiliently decode content (bytes or str) into PDF bytes and extract pages via PyMuPDF."""
-    def try_open(b: bytes):
-        try:
-            doc = fitz.open(stream=b, filetype="pdf")
-            if doc.is_encrypted:
-                try:
-                    doc.authenticate("")
-                except Exception:
-                    doc.close()
-                    raise ValueError("PDF is encrypted")
-            pages = []
-            for i in range(len(doc)):
-                p = doc[i]
-                text = p.get_text("text") or p.get_text("blocks") or p.get_text("dict") or ""
-                pages.append({"page": i+1, "text": text})
-            doc.close()
-            return pages
-        except Exception as e:
-            return None
-
-    if content is None:
-        raise ValueError("Empty PDF content")
-
-    # 1) If bytes already
-    if isinstance(content, (bytes, bytearray)):
-        res = try_open(bytes(content))
-        if res:
-            return res
-
-    # 2) If str, try decoding strategies
-    if isinstance(content, str):
-        s = content.strip()
-
-        # strip data URL
-        if s.startswith("data:") and "," in s:
-            s = s.split(",", 1)[1]
-
-        # a) base64 after removing whitespace
-        try:
-            b = base64.b64decode("".join(s.split()), validate=False)
-            res = try_open(b)
-            if res:
-                return res
-        except Exception:
-            pass
-
-        # b) strict base64
-        try:
-            b = base64.b64decode(s, validate=True)
-            res = try_open(b)
-            if res:
-                return res
-        except Exception:
-            pass
-
-        # c) surrogateescape (preserves arbitrary original bytes often)
-        try:
-            b = s.encode("utf-8", errors="surrogateescape")
-            res = try_open(b)
-            if res:
-                return res
-        except Exception:
-            pass
-
-        # d) latin-1 ignore (preserves bytes 0-255 where possible)
-        try:
-            b = s.encode("latin-1", errors="ignore")
-            res = try_open(b)
-            if res:
-                return res
-        except Exception:
-            pass
-
-        # e) best-effort low-byte fallback: ord(c) & 0xFF for each char
-        try:
-            b = bytes([ord(c) & 0xFF for c in s])
-            res = try_open(b)
-            if res:
-                return res
-        except Exception:
-            pass
-
-        # f) treat as file path
-        try:
-            if os.path.exists(s) and os.path.isfile(s):
-                with open(s, "rb") as f:
-                    b = f.read()
-                res = try_open(b)
-                if res:
-                    return res
-        except Exception:
-            pass
-
-    raise ValueError("Could not decode PDF bytes from content (no candidate succeeded)")
-
+# --- Imports ---
 import os
 import time
 import random
-from dotenv import load_dotenv
-load_dotenv()
-from fastapi import FastAPI, Depends, HTTPException, Request, Body
-
+from fastapi import FastAPI, Depends, HTTPException, Request, Body, File, UploadFile
 from fastapi.responses import JSONResponse
-from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, List, Dict, Any, Tuple
 import firebase_admin
 from firebase_admin import auth, credentials
+from google.cloud import firestore
+from dotenv import load_dotenv
+load_dotenv()
+
+# FastAPI app instance
+app = FastAPI()
+
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import adapters and pipeline
-from firestore_adapter import add_document_metadata, update_document_status, add_chunks, add_summary, get_summary_by_doc_id, get_chunks_by_doc_id
-from pipeline import chunk_text, embed_text, embed_texts, generate_summary
-from google.cloud import firestore
-
-
-load_dotenv()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or specify your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Initialize Firebase Admin SDK (for token validation)
 if not firebase_admin._apps:
@@ -286,147 +34,93 @@ if not firebase_admin._apps:
     else:
         firebase_admin.initialize_app()
 
-# Auth dependency
+# Firebase token verification dependency
 def verify_firebase_token(request: Request):
-    auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid auth header")
-    id_token = auth_header.split(" ", 1)[1]
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        print(f"Auth failed: Missing or invalid Authorization header. Got: {auth_header}")
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    id_token = auth_header.split("Bearer ")[1]
     try:
-        decoded = auth.verify_id_token(id_token)
-        print("decoded token:", decoded)
-        return decoded
+        decoded_token = auth.verify_id_token(id_token)
+        print(f"Decoded token: {decoded_token}")
+        return decoded_token
     except Exception as e:
-        print("token verification error:", e)
+        print(f"Auth failed: Invalid Firebase ID token. Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
 
+# Import adapters and pipeline
+from firestore_adapter import add_document_metadata, update_document_status, add_chunks, add_summary, get_summary_by_doc_id, get_chunks_by_doc_id
+from pipeline import chunk_text, embed_text, embed_texts, generate_summary
 
-app = FastAPI()
+# --- PDF Content Extraction Helpers (PyMuPDF) ---
+import fitz  # PyMuPDF
+import io
 
-# Allow CORS for local dev
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/")
-def root():
-    return {"msg": "Lexplain backend running"}
-
-
-@app.get("/api/debug/genai")
-def debug_genai():
-    import google.generativeai as genai
-    import inspect
-    report = {}
-    report['has_Client'] = hasattr(genai, 'Client')
-    report['has_models'] = hasattr(genai, 'models')
-    report['has_embed_content'] = hasattr(genai, 'embed_content')
-    report['has_embeddings'] = hasattr(genai, 'embeddings')
-    try:
-        if hasattr(genai, 'Client'):
-            try:
-                client = genai.Client()
-                if hasattr(client, 'models') and hasattr(client.models, 'embed_content'):
-                    report['client.models.embed_content_sig'] = str(inspect.signature(client.models.embed_content))
-            except Exception as e:
-                report['client_init_error'] = str(e)
-    except Exception as e:
-        report['client_probe_error'] = str(e)
-    try:
-        if hasattr(genai, 'models') and hasattr(genai.models, 'embed_content'):
-            report['models.embed_content_sig'] = str(inspect.signature(genai.models.embed_content))
-    except Exception as e:
-        report['models_sig_error'] = str(e)
-    try:
-        if hasattr(genai, 'embed_content'):
-            report['embed_content_sig'] = str(inspect.signature(genai.embed_content))
-    except Exception as e:
-        report['embed_content_sig_error'] = str(e)
-    try:
-        if hasattr(genai, 'embeddings') and hasattr(genai.embeddings, 'create'):
-            report['embeddings.create_sig'] = str(inspect.signature(genai.embeddings.create))
-    except Exception as e:
-        report['embeddings_sig_error'] = str(e)
-    return report
+def extract_pages_from_pdf_content(content) -> List[Dict[str, Any]]:
+    """Extract text from PDF file bytes using PyMuPDF."""
+    if not content:
+        raise ValueError("Empty PDF content")
+    if not isinstance(content, (bytes, bytearray)):
+        raise ValueError("PDF extraction expects bytes")
+    doc = fitz.open(stream=content, filetype="pdf")
+    if doc.is_encrypted:
+        try:
+            doc.authenticate("")
+        except Exception:
+            doc.close()
+            raise ValueError("PDF is encrypted")
+    pages = []
+    for i in range(len(doc)):
+        p = doc[i]
+        text = p.get_text("text") or p.get_text("blocks") or p.get_text("dict") or ""
+        pages.append({"page": i+1, "text": text})
+    doc.close()
+    return pages
 
 # --- API Endpoints ---
 
 
 # New endpoint: upload document content directly
-from fastapi import File, UploadFile
-
 @app.post("/api/upload/content")
 async def upload_document_content(
     file: UploadFile = File(...),
     user=Depends(verify_firebase_token)
 ):
+    print(f"Uploading document: {file.filename} for user: {user['uid']}")
+    content = await file.read()
     try:
-        # 1. Read the uploaded file content
-        content = await file.read()
-        
-        # 2. Extract text from PDF
-        try:
-            pages = extract_pages_from_pdf_content(content)
-            # Combine all page text
-            extracted_text = "\n\n".join(page["text"] for page in pages)
-        except ValueError as e:
-            # If not a PDF or extraction fails, treat as plain text
-            extracted_text = content.decode('utf-8', errors='ignore')
-        
-        # 3. Store in Firestore
-        doc = {
-            "ownerId": user["uid"],
-            "filename": file.filename,
-            "status": "uploaded",
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "documentContent": extracted_text,  # Store extracted text, not raw PDF
-        }
-        doc_id = add_document_metadata(doc)
-        
-        return {
-            "document_id": doc_id, 
-            "status": "uploaded",
-            "pageCount": len(pages) if 'pages' in locals() else 1
-        }
-        
+        pages = extract_pages_from_pdf_content(content)
+        extracted_text = "\n\n".join(page["text"] for page in pages)
+        print(f"Extracted {len(pages)} pages from PDF. Preview: {extracted_text[:200]}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
-
-# register_document endpoint is now deprecated (use /api/upload/content)
+        print(f"PDF extraction failed: {e}. Treating as plain text.")
+        extracted_text = content.decode('utf-8', errors='ignore')
+    doc = {
+        "ownerId": user["uid"],
+        "filename": file.filename,
+        "status": "uploaded",
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "documentContent": extracted_text,
+    }
+    doc_id = add_document_metadata(doc)
+    print(f"Document stored with ID: {doc_id}")
+    return {"document_id": doc_id, "status": "uploaded"}
 
 @app.post("/api/process/{document_id}")
 def process_document(document_id: str, user=Depends(verify_firebase_token)):
-    # 1. Update status
+    print(f"Processing document: {document_id} for user: {user['uid']}")
     update_document_status(document_id, "processing")
-    # 2. Get document content from Firestore
     db = firestore.Client()
     doc_ref = db.collection(os.getenv("FIRESTORE_DOCUMENTS_COLLECTION", "documents")).document(document_id)
     doc = doc_ref.get().to_dict()
+    print("Document metadata:", {k:v for k,v in doc.items() if k != 'documentContent'})
     content = doc.get("documentContent", "")
-    # 3. Log content type and try to decode/extract
-    print("CONTENT TYPE:", type(content))
-    if isinstance(content, str):
-        s = content
-        print("LEN:", len(s))
-        print("PREFIX (repr):", repr(s[:200]))
-        print("starts with %PDF- ?", s.startswith("%PDF-"))
-        print("contains %%PDF within first 1024 bytes?", "%PDF-" in s[:1024])
-        print("looks like base64? (fast check):", len(s) > 100 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s[:200]))
-
-    try:
-        pages = extract_pages_from_pdf_content(content)
-    except ValueError as e:
-        print(f"PDF decode/extract failed or content not a PDF: {e}; treating as plain text")
-        pages = [{"page": 1, "text": content}]
-    # 4. Chunk
+    print("Content preview:", content[:200])
+    # Only chunk and embed THIS document's content
+    pages = [{"page": 1, "text": content}]
     chunks = chunk_text(pages)
-    # 5. Embed in batches to respect rate limits and reduce request overhead
+    print(f"Chunked into {len(chunks)} chunks. First chunk preview: {chunks[0]['text'][:100] if chunks else 'No chunks'}")
     batch_size = int(os.getenv("EMBED_BATCH_SIZE", 16))
     try:
         texts = [c["text"] for c in chunks]
@@ -437,49 +131,18 @@ def process_document(document_id: str, user=Depends(verify_firebase_token)):
                 idx = i + j
                 chunks[idx]["embedding"] = emb
                 chunks[idx]["documentId"] = document_id
+        print(f"Embeddings generated for {len(chunks)} chunks.")
     except Exception as e:
         update_document_status(document_id, "failed")
         print("Embedding error:", e)
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
     add_chunks(chunks)
-    # 6. Summarize
     summary = generate_summary(chunks)
     summary_doc = {"documentId": document_id, **summary}
     add_summary(summary_doc)
-    # 7. Format a proper summary
-    formatted_summary = {
-        "summary": [
-            # Convert raw chunks into meaningful summary points
-            "Document Type: Real Estate Purchase Agreement (Form LPB 44-05)",
-            "Key Points:",
-            "• The document appears to be a real estate purchase agreement that must be recorded.",
-            "• Contains provisions for periodic payments and balance adjustments.",
-            "• Includes requirements for property tax payments within 30 days.",
-            "• Special conditions apply if the property is used for agricultural purposes.",
-        ],
-        "risks": [
-            {
-                "label": "Payment Terms",
-                "explanation": "Carefully review the periodic payment schedule and balance adjustment provisions to ensure compliance."
-            },
-            {
-                "label": "Tax Obligations",
-                "explanation": "Property taxes must be paid within 30 days to avoid penalties."
-            },
-            {
-                "label": "Agricultural Use",
-                "explanation": "If property is used for agriculture, additional compliance requirements apply."
-            }
-        ]
-    }
-
-    # 8. Update status and return formatted response
     update_document_status(document_id, "processed")
-    return {
-        "summary": formatted_summary["summary"],
-        "risks": formatted_summary["risks"],
-        "status": "processed"
-    }
+    print(f"Summary generated for document {document_id}.")
+    return {"summary": summary["bullets"], "risks": summary["risks"], "status": "processed"}
 
 @app.get("/api/documents/{document_id}/summary")
 def get_summary(document_id: str, user=Depends(verify_firebase_token)):
@@ -489,42 +152,100 @@ def get_summary(document_id: str, user=Depends(verify_firebase_token)):
     # Optionally fetch highlights (clauses)
     return {**summary, "document_id": document_id}
 
+# --- Similarity Search Helpers ---
+import numpy as np
+
+def cosine_similarity(a, b):
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
+def mmr(query_emb, chunk_embs, K=8, lambda_=0.7):
+    selected = []
+    candidate_idxs = list(range(len(chunk_embs)))
+    sim_to_query = [cosine_similarity(query_emb, emb) for emb in chunk_embs]
+    while len(selected) < K and candidate_idxs:
+        if not selected:
+            idx = max(candidate_idxs, key=lambda i: sim_to_query[i])
+            selected.append(idx)
+            candidate_idxs.remove(idx)
+        else:
+            scores = []
+            for i in candidate_idxs:
+                diversity = max([cosine_similarity(chunk_embs[i], chunk_embs[j]) for j in selected]) if selected else 0
+                score = lambda_ * sim_to_query[i] - (1 - lambda_) * diversity
+                scores.append((score, i))
+            idx = max(scores)[1]
+            selected.append(idx)
+            candidate_idxs.remove(idx)
+    return selected
+
 @app.post("/api/documents/{document_id}/query")
 def query_document(document_id: str, data: dict = Body(...), user=Depends(verify_firebase_token)):
     question = data.get("question")
-    # 1. Retrieve chunks
     chunks = get_chunks_by_doc_id(document_id)
-    # 2. KNN search (simple: return top 2 for MVP)
-    top_chunks = chunks[:2]
-    context = "\n".join([c["text"] for c in top_chunks])
-    # 3. Use Gemini to answer
+    chunk_texts = [c["text"] for c in chunks]
+    chunk_embs = [c["embedding"] for c in chunks]
+    # 1. Embed the query
+    query_emb = embed_text(question)
+    # 2. Top-K pool
+    sim_scores = [cosine_similarity(query_emb, emb) for emb in chunk_embs]
+    pool_size = min(50, len(chunks))
+    top_pool_idxs = sorted(range(len(sim_scores)), key=lambda i: sim_scores[i], reverse=True)[:pool_size]
+    pool_embs = [chunk_embs[i] for i in top_pool_idxs]
+    pool_texts = [chunk_texts[i] for i in top_pool_idxs]
+    # 3. MMR selection
+    K = min(8, len(pool_embs))
+    selected_idxs = mmr(query_emb, pool_embs, K=K, lambda_=0.7)
+    selected_texts = [pool_texts[i] for i in selected_idxs]
+    # 4. Gemini answer
     import google.generativeai as genai
     _API_KEY = os.getenv("GEMINI_API_KEY")
     genai.configure(api_key=_API_KEY)
-    client = genai.Client()
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    context = "\n".join(selected_texts)
     prompt = f"Context: {context}\nQuestion: {question}\nAnswer in plain English in ≤ 120 words. If uncertain, respond 'I don't know — please consult a lawyer' and show the top 2 source snippets used."
-
-    # Small retry loop for transient GenAI rate-limit/quota errors
-    def _genai_generate_with_retries(client, *args, max_attempts=5, base_backoff=1.0, **kwargs):
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return client.generate_content(*args, **kwargs)
-            except Exception as e:
-                msg = str(e).lower()
-                retryable = any(tok in msg for tok in ("429", "rate limit", "rate_limit", "quota", "too many requests", "resource_exhausted", "temporarily unavailable", "unavailable"))
-                if not retryable or attempt >= max_attempts:
-                    raise
-                backoff = base_backoff * (2 ** (attempt - 1))
-                jitter = random.uniform(0, 0.5 * backoff)
-                sleep_time = backoff + jitter
-                print(f"Transient generate_content error (attempt {attempt}/{max_attempts}): {e}; retrying in {sleep_time:.1f}s")
-                time.sleep(sleep_time)
-
-    result = _genai_generate_with_retries(client, model="gemini-pro", contents=[{"role": "user", "parts": [prompt]}])
-    answer = result.candidates[0].content.parts[0].text if result.candidates else "No answer."
+    response = model.generate_content(prompt)
+    answer = response.text if hasattr(response, 'text') else "No answer."
     sources = [
-        {"document_id": document_id, "page": c.get("startPage", 1), "snippet": c["text"][:60]} for c in top_chunks
+        {"document_id": document_id, "snippet": t[:60]} for t in selected_texts
     ]
     return {"answer": answer, "sources": sources}
+
+@app.post("/api/documents/{document_id}/summarize")
+def summarize_document(document_id: str, user=Depends(verify_firebase_token)):
+    chunks = get_chunks_by_doc_id(document_id)
+    if not chunks or len(chunks) == 0:
+        print("No chunks found, processing document first...")
+        process_document(document_id, user)
+    chunks = get_chunks_by_doc_id(document_id)
+    if not chunks:
+        raise HTTPException(status_code=500, detail="Failed to generate chunks")
+
+    chunk_texts = [c["text"] for c in chunks]
+    chunk_embs = [c["embedding"] for c in chunks]
+    # Use MMR to select diverse, representative chunks for summary
+    summary_prompt = "Summarize the following document in plain English, focusing on key points and risks."
+    summary_emb = embed_text(summary_prompt)
+    pool_size = min(50, len(chunks))
+    top_pool_idxs = sorted(range(len(chunk_embs)), key=lambda i: cosine_similarity(summary_emb, chunk_embs[i]), reverse=True)[:pool_size]
+    pool_embs = [chunk_embs[i] for i in top_pool_idxs]
+    pool_texts = [chunk_texts[i] for i in top_pool_idxs]
+    K = min(10, len(pool_embs))
+    selected_idxs = mmr(summary_emb, pool_embs, K=K, lambda_=0.5)
+    selected_texts = [pool_texts[i] for i in selected_idxs]
+    # Gemini summary
+    import google.generativeai as genai
+    _API_KEY = os.getenv("GEMINI_API_KEY")
+    genai.configure(api_key=_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    context = "\n".join(selected_texts)
+    prompt = f"Context: {context}\n{summary_prompt}"
+    response = model.generate_content(prompt)
+    summary = response.text if hasattr(response, 'text') else "No summary."
+    print(f"Fetched {len(chunks)} chunks")
+    print(f"Example chunk text: {chunks[0]['text'][:200] if chunks else 'None'}")
+
+    return {"summary": summary}
+
+
