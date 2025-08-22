@@ -1,4 +1,3 @@
-// app/chat/page.tsx (Main chat page - shows when no session selected)
 "use client";
 import React, { useEffect, useState } from "react";
 import {

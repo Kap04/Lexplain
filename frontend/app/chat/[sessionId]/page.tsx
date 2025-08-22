@@ -1,4 +1,3 @@
-// app/chat/[sessionId]/page.tsx (Individual chat session page)
 "use client";
 import React, { useEffect, useRef, useState } from "react";
 import {

@@ -1,6 +1,9 @@
+"use client"
 import Link from "next/link";
 import Image from "next/image";
-
+import { InteractiveHoverButton } from "@/components/magicui/interactive-hover-button";
+import { SparklesText } from "@/components/magicui/sparkles-text";
+import { motion } from "framer-motion";
 
 export default function Home() {
   return (
@@ -10,8 +13,15 @@ export default function Home() {
         {/* Text Section */}
         <div className="max-w-2xl col-span-1 flex flex-col justify-center h-full">
           <h1 className="text-7xl font-bold text-gray-900 leading-tight">
-            Demystify Legal Documents with{" "}
-            <span className="text-blue-900">AI</span>
+            <motion.span
+              initial={{ filter: "blur(8px)", opacity: 0 }}
+              animate={{ filter: "blur(0px)", opacity: 1 }}
+              transition={{ duration: 1.8, ease: "easeOut" }}
+              className="font-bold"
+            >
+              Demystrify
+            </motion.span>
+            {" "}Legal Documents with <SparklesText className="text-[#7C3AED]">AI</SparklesText>
           </h1>
           <p className="mt-6 text-2xl text-gray-600">
             Upload contracts, rental agreements, or terms of service and get
@@ -23,9 +33,9 @@ export default function Home() {
           </p>
           <div className="flex justify-end md:justify-end pr-20">
             <Link href="/chat/new">
-              <button className="mt-10 px-8 py-4 cursor-pointer bg-yellow-700 text-white text-xl rounded-lg hover:bg-yellow-800 transition">
+              <InteractiveHoverButton className="mt-10 px-8 py-4 cursor-pointer bg-yellow-700 text-white text-xl rounded-lg hover:bg-yellow-800 transition">
                 Get Started
-              </button>
+              </InteractiveHoverButton>
             </Link>
           </div>
         </div>
@@ -51,6 +61,4 @@ export default function Home() {
 }
 
 
-
-//magnet animation on "get Started" button 
-//Glitch Text on AI button 
+//Interactive hover button from magicUi
