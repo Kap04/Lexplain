@@ -1,3 +1,4 @@
+#pipeline.py
 # --- PDF Text Extraction (PyMuPDF) ---
 import fitz  # PyMuPDF
 
@@ -503,10 +504,79 @@ def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
     return all_embeddings
 
 
-# --- Summarization (mocked) ---
+# --- Summarization (real) ---
+import re, json
+import google.generativeai as genai
+
+_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", "gemini-1.5-flash")
+_MAX_SUMMARY_CHUNKS = int(os.getenv("SUMMARY_MAX_CHUNKS", 12))   # cap cost/time
+_PER_CHUNK_WORDS = int(os.getenv("SUMMARY_PER_CHUNK_WORDS", 28)) # brevity target
+
+def _summarize_one_chunk(text: str) -> str:
+    """Return one concise bullet (string) for a chunk."""
+    if not text.strip():
+        return ""
+    model = genai.GenerativeModel(_SUMMARY_MODEL)
+    prompt = (
+        "Summarize the following legal text as ONE short bullet "
+        f"(≤{_PER_CHUNK_WORDS} words). Focus on obligations, fees, "
+        "dates/renewal/termination, liabilities, and privacy. "
+        "No preamble, no numbering, no quotes—return only the bullet text.\n\n"
+        f"---\n{text}\n---"
+    )
+    try:
+        resp = model.generate_content(prompt)
+        bullet = (resp.text or "").strip()
+        bullet = re.sub(r"^[\-•\s]+", "", bullet)  # strip leading bullet chars
+        return bullet
+    except Exception as e:
+        # Fall back to a trimmed snippet so we never return the old placeholder
+        return text.strip()[:120] + ("…" if len(text) > 120 else "")
+
+def _infer_risks_from_bullets(bullets: list[str]) -> list[dict]:
+    """Ask the model for up to 3 potential risks based on bullets; best-effort JSON."""
+    bullets_clean = "\n".join(f"- {b}" for b in bullets if b)
+    if not bullets_clean.strip():
+        return []
+    model = genai.GenerativeModel(_SUMMARY_MODEL)
+    prompt = (
+        "Given these bullets extracted from a legal document, identify up to 3 potential risks. "
+        "Return ONLY a JSON array, where each item has keys 'label' and 'explanation'.\n\n"
+        f"{bullets_clean}\n\nJSON:"
+    )
+    try:
+        resp = model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        # try to extract JSON array
+        m = re.search(r"\[\s*{.*}\s*\]", txt, flags=re.S)
+        risks = json.loads(m.group(0)) if m else json.loads(txt)
+        # basic shape cleanup
+        out = []
+        for r in risks:
+            out.append({
+                "label": r.get("label", "").strip()[:80],
+                "explanation": r.get("explanation", "").strip()[:400],
+            })
+        return out[:3]
+    except Exception:
+        return []
+
 def generate_summary(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    bullets = [f"Summary of chunk {i+1}: {c['text'][:40]}..." for i, c in enumerate(chunks[:5])]
-    risks = [
-        {"label": "Mock Risk", "explanation": "This is a mock risk.", "source": {"page": 1, "snippet": "..."}}
-    ]
+    """
+    Summarize each chunk with Gemini (1 bullet per chunk) and optionally infer risks.
+    Returns: {"bullets": [str], "risks": [{"label": str, "explanation": str}, ...]}
+    """
+    if not chunks:
+        return {"bullets": [], "risks": []}
+
+    # Limit how many chunks we summarize to control cost/latency
+    subset = chunks[:_MAX_SUMMARY_CHUNKS]
+
+    bullets: list[str] = []
+    for c in subset:
+        b = _summarize_one_chunk(c.get("text", ""))
+        if b:
+            bullets.append(b)
+
+    risks = _infer_risks_from_bullets(bullets)
     return {"bullets": bullets, "risks": risks}

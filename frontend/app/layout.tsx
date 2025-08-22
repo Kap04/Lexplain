@@ -14,10 +14,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body className={inter.className}>
         <main>{children}</main>
-        <footer style={{textAlign:'center',marginTop:32,fontSize:12}}>
+        {/* <footer style={{textAlign:'center',marginTop:32,fontSize:12}}>
           <hr />
           <div style={{color:'#888'}}>This tool provides informational summaries only, not legal advice.</div>
-        </footer>
+        </footer> */}
       </body>
     </html>
   );

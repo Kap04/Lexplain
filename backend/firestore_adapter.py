@@ -1,7 +1,10 @@
+# firestore_adapter.py
+
 import os
 from google.cloud import firestore
 from typing import Dict, Any
 
+# Consistent collection names
 COLLECTION_DOCUMENTS = os.getenv("FIRESTORE_DOCUMENTS_COLLECTION", "documents")
 COLLECTION_CHUNKS = os.getenv("FIRESTORE_EMBEDDINGS_COLLECTION", "chunks")
 COLLECTION_SUMMARIES = os.getenv("FIRESTORE_SUMMARIES_COLLECTION", "summaries")
@@ -26,13 +29,114 @@ def add_chunks(chunks: list):
 def add_summary(summary: Dict[str, Any]):
     db.collection(COLLECTION_SUMMARIES).add(summary)
 
-def add_qa_session(qa: Dict[str, Any]):
-    db.collection(COLLECTION_QA).add(qa)
+def _serialize_firestore_session(data, doc_id):
+    """Helper function to serialize Firestore session data"""
+    # Convert Firestore timestamp to ISO string if present
+    if "createdAt" in data and hasattr(data["createdAt"], "isoformat"):
+        data["createdAt"] = data["createdAt"].isoformat()
+    
+    # Convert message timestamps
+    if "messages" in data and isinstance(data["messages"], list):
+        for message in data["messages"]:
+            if isinstance(message, dict) and "timestamp" in message:
+                if hasattr(message["timestamp"], "isoformat"):
+                    message["timestamp"] = message["timestamp"].isoformat()
+    
+    # Ensure consistent session_id field
+    data["session_id"] = doc_id
+    data["sessionId"] = doc_id  # For backward compatibility
+    return data
+
+def add_qa_session(qa: Dict[str, Any]) -> str:
+    """Add a new QA session and return its ID, setting session_id at creation."""
+    temp_ref = db.collection(COLLECTION_QA).document()
+    session_id = temp_ref.id
+    qa = dict(qa)
+    qa["session_id"] = session_id
+    qa["sessionId"] = session_id
+    temp_ref.set(qa)
+    return session_id
+
+def get_qa_sessions_by_user(user_id: str):
+    """Get all QA sessions for a user, ordered by creation date."""
+    sessions = []
+    try:
+        docs = db.collection(COLLECTION_QA)\
+                .where("userId", "==", user_id)\
+                .order_by("createdAt", direction=firestore.Query.DESCENDING)\
+                .stream()
+        
+        for doc in docs:
+            data = doc.to_dict()
+            if data:  # Ensure data exists
+                sessions.append(_serialize_firestore_session(data, doc.id))
+    except Exception as e:
+        print(f"Error fetching sessions for user {user_id}: {e}")
+    
+    return sessions
+
+def get_qa_session_by_id(session_id: str):
+    """Get a QA session by its ID."""
+    try:
+        doc = db.collection(COLLECTION_QA).document(session_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data:
+                return _serialize_firestore_session(data, doc.id)
+    except Exception as e:
+        print(f"Error fetching session {session_id}: {e}")
+    
+    return None
+
+def update_qa_session_messages(session_id: str, new_messages: list):
+    """Append new messages to a QA session."""
+    try:
+        # Clean messages before storing
+        def clean_message(msg):
+            msg = dict(msg)
+            if "timestamp" in msg and hasattr(msg["timestamp"], "isoformat"):
+                msg["timestamp"] = msg["timestamp"].isoformat()
+            elif "timestamp" not in msg:
+                from datetime import datetime
+                msg["timestamp"] = datetime.utcnow().isoformat()
+            return msg
+        
+        cleaned_messages = [clean_message(m) for m in new_messages]
+        
+        db.collection(COLLECTION_QA).document(session_id).update({
+            "messages": firestore.ArrayUnion(cleaned_messages)
+        })
+    except Exception as e:
+        print(f"Error updating messages for session {session_id}: {e}")
+        raise e
+
+def update_qa_session_field(session_id: str, field_name: str, field_value):
+    """Update a specific field in a QA session."""
+    try:
+        db.collection(COLLECTION_QA).document(session_id).update({
+            field_name: field_value
+        })
+    except Exception as e:
+        print(f"Error updating field {field_name} for session {session_id}: {e}")
+        raise e
+
+def delete_qa_session(session_id: str):
+    """Delete a QA session."""
+    try:
+        db.collection(COLLECTION_QA).document(session_id).delete()
+    except Exception as e:
+        print(f"Error deleting session {session_id}: {e}")
+        raise e
 
 def get_summary_by_doc_id(doc_id: str):
-    docs = db.collection(COLLECTION_SUMMARIES).where("documentId", "==", doc_id).stream()
-    for doc in docs:
-        return doc.to_dict()
+    """Get document summary by document ID."""
+    try:
+        docs = db.collection(COLLECTION_SUMMARIES).where("documentId", "==", doc_id).stream()
+        for doc in docs:
+            return doc.to_dict()
+    except Exception as e:
+        print(f"Error fetching summary for document {doc_id}: {e}")
+    
     return None
 
 def get_chunks_by_doc_id(doc_id: str):
@@ -41,15 +145,19 @@ def get_chunks_by_doc_id(doc_id: str):
     Each chunk contains both the original text and the embedding.
     """
     chunks = []
-    docs = db.collection(COLLECTION_CHUNKS).where("documentId", "==", doc_id).stream()
+    try:
+        docs = db.collection(COLLECTION_CHUNKS).where("documentId", "==", doc_id).stream()
 
-    for doc in docs:
-        data = doc.to_dict()
-        chunks.append({
-            "chunkId": doc.id,
-            "text": data.get("text"),           # human-readable chunk text
-            "embedding": data.get("embedding"), # vector for similarity search
-            "metadata": data.get("metadata", {}) # optional, e.g., page number
-        })
+        for doc in docs:
+            data = doc.to_dict()
+            if data:
+                chunks.append({
+                    "chunkId": doc.id,
+                    "text": data.get("text"),           # human-readable chunk text
+                    "embedding": data.get("embedding"), # vector for similarity search
+                    "metadata": data.get("metadata", {}) # optional, e.g., page number
+                })
+    except Exception as e:
+        print(f"Error fetching chunks for document {doc_id}: {e}")
     
     return chunks
