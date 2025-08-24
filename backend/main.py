@@ -1,55 +1,87 @@
-
-# ...existing code...
-
-# Place this with the other @app.* routes after app = FastAPI()
-
-# ...existing code...
-
-# Place this after verify_firebase_token and app = FastAPI()
-
-# ...existing code...
-
-# --- PDF Content Extraction Helpers (PyMuPDF) ---
-
-# --- Imports ---
 import os
-
+import json
 from fastapi import FastAPI, Depends, HTTPException, Request, Body, File, UploadFile
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any, Tuple
 import firebase_admin
 from firebase_admin import auth, credentials
 from google.cloud import firestore
+from google.oauth2 import service_account
 from dotenv import load_dotenv
 # Add these imports at the top of main.py
 import threading
 import traceback
 from datetime import datetime
+import time
 
 load_dotenv()
 
 # FastAPI app instance
 app = FastAPI()
 
+# Global variable to hold the Firestore client
+db = None
+
 from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "http://localhost:3000",               # for local dev
+    "https://lexplain-ebon.vercel.app",    # your Vercel frontend
+    "https://lexplain-ebon.vercel.app"
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or specify your frontend URL
+    allow_origins=origins,  
     allow_credentials=True,
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
 
-# Initialize Firebase Admin SDK (for token validation)
+# Initialize Firebase Admin SDK and Firestore
 if not firebase_admin._apps:
-    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if cred_path and os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-    else:
-        firebase_admin.initialize_app()
+    try:
+        # Try to get credentials from environment variable (Railway/Render approach)
+        # Use a different env var name to avoid conflicts with Google's default credential discovery
+        google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        
+        if google_creds_json:
+            # Parse the JSON string from environment variable
+            creds_dict = json.loads(google_creds_json)
+            
+            # Initialize Firebase Admin
+            cred = credentials.Certificate(creds_dict)
+            firebase_admin.initialize_app(cred)
+            
+            # Initialize Firestore with explicit credentials
+            firestore_creds = service_account.Credentials.from_service_account_info(creds_dict)
+            db = firestore.Client(credentials=firestore_creds, project=creds_dict['project_id'])
+            
+            print("✅ Firebase and Firestore initialized successfully with env credentials")
+            
+        else:
+            # Fallback to default credentials (local development)
+            firebase_admin.initialize_app()
+            db = firestore.Client()
+            print("✅ Firebase and Firestore initialized with default credentials")
+            
+    except Exception as e:
+        print(f"❌ Failed to initialize Firebase/Firestore: {e}")
+        raise RuntimeError(f"Firebase initialization failed: {e}")
+else:
+    # If Firebase is already initialized, just get Firestore client
+    try:
+        google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if google_creds_json:
+            creds_dict = json.loads(google_creds_json)
+            firestore_creds = service_account.Credentials.from_service_account_info(creds_dict)
+            db = firestore.Client(credentials=firestore_creds, project=creds_dict['project_id'])
+        else:
+            db = firestore.Client()
+        print("✅ Firestore client created (Firebase already initialized)")
+    except Exception as e:
+        print(f"❌ Failed to create Firestore client: {e}")
+        raise RuntimeError(f"Firestore client creation failed: {e}")
 
 # Firebase token verification dependency
 def verify_firebase_token(request: Request):
@@ -66,16 +98,22 @@ def verify_firebase_token(request: Request):
         print(f"Auth failed: Invalid Firebase ID token. Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
 
+# Import firestore functions AFTER db is initialized
+from firestore_adapter import (
+    add_document_metadata, update_document_status, add_chunks, add_summary, 
+    get_summary_by_doc_id, get_chunks_by_doc_id, add_qa_session, 
+    get_qa_sessions_by_user, get_qa_session_by_id, update_qa_session_messages, 
+    update_qa_session_field, delete_qa_session
+)
+from pipeline import chunk_text, debug_simple_embedding_test, embed_text, embed_texts, generate_summary
+
 @app.delete("/api/chat/session/{session_id}")
 def delete_chat_session(session_id: str, user=Depends(verify_firebase_token)):
-    session = get_qa_session_by_id(session_id)
+    session = get_qa_session_by_id(db, session_id)
     if not session or session.get("userId") != user["uid"]:
         raise HTTPException(status_code=404, detail="Session not found")
-    delete_qa_session(session_id)
+    delete_qa_session(db, session_id)
     return {"success": True}
-# Import adapters and pipeline
-from firestore_adapter import add_document_metadata, update_document_status, add_chunks, add_summary, get_summary_by_doc_id, get_chunks_by_doc_id
-from pipeline import chunk_text, embed_text, embed_texts, generate_summary
 
 # --- PDF Content Extraction Helpers (PyMuPDF) ---
 import fitz  # PyMuPDF
@@ -169,7 +207,7 @@ async def upload_document_content(
         "createdAt": firestore.SERVER_TIMESTAMP,
         "documentContent": extracted_text,
     }
-    doc_id = add_document_metadata(doc)
+    doc_id = add_document_metadata(db, doc)  # Pass db
     print(f"Document stored with ID: {doc_id}")
 
     # --- Start processing in background so embeddings are created immediately ---
@@ -183,11 +221,6 @@ async def upload_document_content(
     return {"document_id": doc_id, "status": "uploaded"}
 
 
-@app.post("/api/process/{document_id}")
-def process_document(document_id: str, user=Depends(verify_firebase_token)):
-    # Synchronous request to (re-)process the document using same helper:
-    _process_document_sync(document_id, user["uid"])
-    return {"status": "processing_started"}
 
 
 def _process_document_sync(document_id: str, owner_uid: str):
@@ -195,21 +228,22 @@ def _process_document_sync(document_id: str, owner_uid: str):
        Can be called directly (synchronously) or from a background thread.
     """
     try:
+        # Add this before the embedding code in _process_document_sync
+        debug_simple_embedding_test()
         print(f"[processor] Starting processing for {document_id} (owner {owner_uid})")
-        update_document_status(document_id, "processing")
-        db = firestore.Client()
+        update_document_status(db, document_id, "processing")  # Pass db
         doc_ref = db.collection(os.getenv("FIRESTORE_DOCUMENTS_COLLECTION", "documents")).document(document_id)
         snapshot = doc_ref.get()
         if not snapshot.exists:
             print(f"[processor] Document {document_id} not found")
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
             return
 
         doc = snapshot.to_dict() or {}
         content = doc.get("documentContent", "")
         if not content:
             print(f"[processor] No content for {document_id}")
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
             return
 
         # create pages (you are storing as single-page extracted content)
@@ -217,40 +251,78 @@ def _process_document_sync(document_id: str, owner_uid: str):
         chunks = chunk_text(pages)
         if not chunks:
             print(f"[processor] No chunks generated for {document_id}")
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
             return
 
         print(f"[processor] {len(chunks)} chunks created for {document_id} (preview: {chunks[0]['text'][:120]})")
 
-        # embed in batches
-        batch_size = int(os.getenv("EMBED_BATCH_SIZE", 16))
+        # embed in batches with delays
+        batch_size = int(os.getenv("EMBED_BATCH_SIZE", 2))  # Reduced default batch size
         try:
             texts = [c["text"] for c in chunks]
+            total_batches = (len(texts) + batch_size - 1) // batch_size
+            print(f"[processor] Processing {len(texts)} texts in {total_batches} batches")
+            
             for i in range(0, len(texts), batch_size):
+                batch_num = (i // batch_size) + 1
                 batch_texts = texts[i:i+batch_size]
-                embeddings = embed_texts(batch_texts)
-                for j, emb in enumerate(embeddings):
-                    idx = i + j
-                    chunks[idx]["embedding"] = emb
-                    chunks[idx]["documentId"] = document_id
-            print(f"[processor] Embeddings generated for {len(chunks)} chunks.")
+                
+                print(f"[processor] Processing embedding batch {batch_num}/{total_batches} ({len(batch_texts)} items)")
+                
+                try:
+                    # Add a small delay before each batch
+                    if i > 0:  # Don't delay before the first batch
+                        sleep_time = 3.0  # 3 seconds between batches
+                        print(f"[processor] Waiting {sleep_time}s before next embedding batch...")
+                        time.sleep(sleep_time)
+                    
+                    embeddings = embed_texts(batch_texts)
+                    
+                    # Assign embeddings to chunks
+                    for j, emb in enumerate(embeddings):
+                        idx = i + j
+                        if idx < len(chunks):  # Safety check
+                            chunks[idx]["embedding"] = emb
+                            chunks[idx]["documentId"] = document_id
+                    
+                    print(f"[processor] ✅ Batch {batch_num}/{total_batches} completed successfully")
+                    
+                except Exception as batch_e:
+                    print(f"[processor] ❌ Embedding error for batch {batch_num}: {batch_e}")
+                    # Add longer delay before retrying or continuing
+                    time.sleep(5.0)
+                    raise batch_e
+            
+            print(f"[processor] ✅ All embeddings generated for {len(chunks)} chunks.")
+            
         except Exception as e:
             print(f"[processor] Embedding error for {document_id}: {e}")
             traceback.print_exc()
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
             return
+
+        # Small delay before storing chunks
+        print("[processor] Waiting 2s before storing chunks...")
+        time.sleep(2.0)
 
         # persist chunks and summary
         try:
-            add_chunks(chunks)
+            add_chunks(db, chunks)  # Pass db
+            print(f"[processor] ✅ Chunks stored successfully")
         except Exception as e:
             print(f"[processor] add_chunks failed for {document_id}: {e}")
             traceback.print_exc()
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
             return
 
+        # Small delay before generating summary
+        print("[processor] Waiting 2s before generating summary...")
+        time.sleep(2.0)
+
         try:
+            print(f"[processor] Generating summary for {len(chunks)} chunks...")
             summary_data = generate_summary(chunks)
+            
             # Create combined summary text
             combined_summary = _create_combined_summary(summary_data)
             
@@ -261,28 +333,36 @@ def _process_document_sync(document_id: str, owner_uid: str):
                 "summary": combined_summary  # Add the combined summary
             }
             print("Generated summary after processing:", summary_doc)
-            add_summary(summary_doc)
+            add_summary(db, summary_doc)  # Pass db
+            print(f"[processor] ✅ Summary stored successfully")
+            
         except Exception as e:
             print(f"[processor] add_summary failed for {document_id}: {e}")
             traceback.print_exc()
             # still mark processed if chunking/embeds worked; but mark partial
-            update_document_status(document_id, "processed_with_summary_error")
+            update_document_status(db, document_id, "processed_with_summary_error")  # Pass db
             return
 
-        update_document_status(document_id, "processed")
-        print(f"[processor] Document {document_id} processed successfully.")
+        update_document_status(db, document_id, "processed")  # Pass db
+        print(f"[processor] ✅ Document {document_id} processed successfully.")
+        
     except Exception as e:
         print(f"[processor] Unexpected error while processing {document_id}: {e}")
         traceback.print_exc()
         try:
-            update_document_status(document_id, "failed")
+            update_document_status(db, document_id, "failed")  # Pass db
         except Exception:
             pass
 
+@app.post("/api/process/{document_id}")
+def process_document(document_id: str, user=Depends(verify_firebase_token)):
+    # Synchronous request to (re-)process the document using same helper:
+    _process_document_sync(document_id, user["uid"])
+    return {"status": "processing_started"}
 
 @app.get("/api/documents/{document_id}/summary")
 def get_summary(document_id: str, user=Depends(verify_firebase_token)):
-    summary_data = get_summary_by_doc_id(document_id)
+    summary_data = get_summary_by_doc_id(db, document_id)  # Pass db
     if not summary_data:
         raise HTTPException(status_code=404, detail="Summary not found")
     
@@ -325,7 +405,7 @@ def mmr(query_emb, chunk_embs, K=8, lambda_=0.7):
 @app.post("/api/documents/{document_id}/query")
 def query_document(document_id: str, data: dict = Body(...), user=Depends(verify_firebase_token)):
     question = data.get("question")
-    chunks = get_chunks_by_doc_id(document_id)
+    chunks = get_chunks_by_doc_id(db, document_id)  # Pass db
     chunk_texts = [c["text"] for c in chunks]
     chunk_embs = [c["embedding"] for c in chunks]
     # 1. Embed the query
@@ -356,11 +436,11 @@ def query_document(document_id: str, data: dict = Body(...), user=Depends(verify
 
 @app.post("/api/documents/{document_id}/summarize")
 def summarize_document(document_id: str, user=Depends(verify_firebase_token)):
-    chunks = get_chunks_by_doc_id(document_id)
+    chunks = get_chunks_by_doc_id(db, document_id)  # Pass db
     if not chunks or len(chunks) == 0:
         print("No chunks found, processing document first...")
         process_document(document_id, user)
-    chunks = get_chunks_by_doc_id(document_id)
+    chunks = get_chunks_by_doc_id(db, document_id)  # Pass db
     if not chunks:
         raise HTTPException(status_code=500, detail="Failed to generate chunks")
 
@@ -390,7 +470,6 @@ def summarize_document(document_id: str, user=Depends(verify_firebase_token)):
 
     return {"summary": summary}
 
-from firestore_adapter import add_qa_session, get_qa_sessions_by_user, get_qa_session_by_id, update_qa_session_messages, delete_qa_session
 # Add this import for title generation
 import re
 
@@ -405,11 +484,10 @@ def create_chat_session(data: dict = Body(...), user=Depends(verify_firebase_tok
         "createdAt": firestore.SERVER_TIMESTAMP,
         "title": data.get("title") or "New Chat"
     }
-    session_id = add_qa_session(session)
+    session_id = add_qa_session(db, session)  # Pass db
     
     # IMPORTANT: Update the session to include its own ID as a field
-    from firestore_adapter import update_qa_session_field
-    update_qa_session_field(session_id, "session_id", session_id)
+    update_qa_session_field(db, session_id, "session_id", session_id)  # Pass db
     
     return {"session_id": session_id}
 
@@ -434,7 +512,7 @@ def generate_title_from_message(message_text: str) -> str:
 @app.post("/api/chat/session/{session_id}/message")
 def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends(verify_firebase_token)):
     """Add a message to a chat session and get AI response."""
-    session = get_qa_session_by_id(session_id)
+    session = get_qa_session_by_id(db, session_id)  # Pass db
     if not session or session.get("userId") != user["uid"]:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -452,7 +530,7 @@ def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends
     }
     
     # Generate AI response (same logic as before)
-    chunks = get_chunks_by_doc_id(document_id)
+    chunks = get_chunks_by_doc_id(db, document_id)  # Pass db
     chunk_texts = [c["text"] for c in chunks]
     chunk_embs = [c["embedding"] for c in chunks]
     query_emb = embed_text(data["text"])
@@ -480,16 +558,15 @@ def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends
     }
     
     # Update session with new messages
-    update_qa_session_messages(session_id, [user_message, ai_message])
+    update_qa_session_messages(db, session_id, [user_message, ai_message])  # Pass db
     
     # Generate and update title if this is the first message
     updated_session = session  # Default
     if is_first_message:
         new_title = generate_title_from_message(data["text"])
-        from firestore_adapter import update_qa_session_field
-        update_qa_session_field(session_id, "title", new_title)
+        update_qa_session_field(db, session_id, "title", new_title)  # Pass db
         # Get updated session
-        updated_session = get_qa_session_by_id(session_id)
+        updated_session = get_qa_session_by_id(db, session_id)  # Pass db
     
     return {
         "messages": [user_message, ai_message],
@@ -499,12 +576,12 @@ def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends
 @app.get("/api/chat/sessions")
 def list_chat_sessions(user=Depends(verify_firebase_token)):
     """List all chat sessions for the user."""
-    sessions = get_qa_sessions_by_user(user["uid"])
+    sessions = get_qa_sessions_by_user(db, user["uid"])  # Pass db
     return {"sessions": sessions}
 
 @app.get("/api/chat/session/{session_id}")
 def get_chat_session(session_id: str, user=Depends(verify_firebase_token)):
-    session = get_qa_session_by_id(session_id)
+    session = get_qa_session_by_id(db, session_id)  # Pass db
     if not session or session.get("userId") != user["uid"]:
         raise HTTPException(status_code=404, detail="Session not found")
     return session

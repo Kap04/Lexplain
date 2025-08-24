@@ -14,6 +14,14 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 from typing import List, Dict, Any
 import inspect
 import google.generativeai as genai
+# Also import the new google.genai for latest API
+try:
+    from google import genai as new_genai
+    HAS_NEW_API = True
+    print("✅ Using latest Google Generative AI API")
+except ImportError:
+    HAS_NEW_API = False
+    print("⚠️ Using legacy Google Generative AI API")
 import os
 import time
 import random
@@ -25,6 +33,32 @@ try:
     _HAS_ZONEINFO = True
 except Exception:
     _HAS_ZONEINFO = False
+
+
+# Add this debug function to your pipeline.py
+
+def debug_api_connection():
+    """Test API connection and quota status"""
+    try:
+        print(f"Testing Gemini API connection...")
+        print(f"API Key present: {'GEMINI_API_KEY' in os.environ}")
+        print(f"Rate limits: RPM={_RPM}, TPM={_TPM}, RPD={_RPD}")
+        print(f"Quota available: {_RATE_LIMITER.is_quota_available()}")
+        
+        # Test a minimal embedding request
+        test_result = embed_text("Hello world")
+        print(f"Test embedding successful: {len(test_result)} dimensions")
+        return True
+    except Exception as e:
+        print(f"API connection test failed: {e}")
+        return False
+
+# Call this at the start of your main processing function
+def process_document_with_debug(*args, **kwargs):
+    print("=== Starting Railway Debug ===")
+    debug_api_connection()
+    print("=== End Railway Debug ===")
+    # Continue with your normal processing...
 
 # --- Chunking ---
 def chunk_text(pages: List[Dict[str, Any]], chunk_size=500, overlap=50) -> List[Dict[str, Any]]:
@@ -51,8 +85,8 @@ if not _API_KEY:
 genai.configure(api_key=_API_KEY)
 
 # --- Rate limiter with better quota handling ---
-_RPM = int(os.getenv("GEMINI_EMBEDDING_RPM", 15))  # Reduced from 100
-_TPM = int(os.getenv("GEMINI_EMBEDDING_TPM", 1500))  # Reduced from 30000
+_RPM = int(os.getenv("GEMINI_EMBEDDING_RPM", 5))  # Reduced from 100
+_TPM = int(os.getenv("GEMINI_EMBEDDING_TPM", 500))  # Reduced from 30000
 _RPD = int(os.getenv("GEMINI_EMBEDDING_RPD", 100))   # Reduced from 1000
 
 
@@ -68,6 +102,8 @@ def _estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 2))
 
 
+# Updated RateLimiter class with Railway-specific fixes
+
 class RateLimiter:
     def __init__(self, rpm=_RPM, tpm=_TPM, rpd=_RPD):
         self.rpm = rpm
@@ -80,6 +116,9 @@ class RateLimiter:
         self.lock = threading.Lock()
         self.quota_exhausted = False
         self.quota_reset_time = None
+        # Add consecutive failures tracking
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 3
 
     def _reset_daily_if_needed(self):
         today = _pt_date_now()
@@ -89,6 +128,7 @@ class RateLimiter:
             # Reset quota exhaustion flag daily
             self.quota_exhausted = False
             self.quota_reset_time = None
+            self.consecutive_failures = 0  # Reset failure count
 
     def mark_quota_exhausted(self, reset_time_hours=24):
         """Mark quota as exhausted with estimated reset time"""
@@ -96,6 +136,19 @@ class RateLimiter:
             self.quota_exhausted = True
             self.quota_reset_time = time.time() + (reset_time_hours * 3600)
             print(f"Quota marked as exhausted. Estimated reset in {reset_time_hours} hours.")
+
+    def mark_failure(self):
+        """Track consecutive failures to detect quota issues early"""
+        with self.lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                print(f"Too many consecutive failures ({self.consecutive_failures}), marking quota as exhausted")
+                self.mark_quota_exhausted(1)  # Shorter reset time for failure-based exhaustion
+
+    def mark_success(self):
+        """Reset failure counter on successful request"""
+        with self.lock:
+            self.consecutive_failures = 0
 
     def is_quota_available(self):
         """Check if quota might be available again"""
@@ -106,6 +159,7 @@ class RateLimiter:
                 print("Quota reset time passed, attempting to clear exhaustion flag")
                 self.quota_exhausted = False
                 self.quota_reset_time = None
+                self.consecutive_failures = 0
                 return True
             return False
 
@@ -130,13 +184,12 @@ class RateLimiter:
                 current_rpm = len(self.req_timestamps)
                 current_tpm = sum(t for ts, t in self.token_timestamps)
                 
-                # Compute wait needed for rpm
+                # More conservative wait calculation
                 wait_rpm = 0.0
                 if current_rpm >= self.rpm:
                     oldest = self.req_timestamps[0]
-                    wait_rpm = 60 - (now - oldest)
+                    wait_rpm = 60 - (now - oldest) + 1  # Add 1 second buffer
                 
-                # Compute wait needed for tpm
                 wait_tpm = 0.0
                 if current_tpm + estimated_tokens > self.tpm:
                     needed = (current_tpm + estimated_tokens) - self.tpm
@@ -145,7 +198,7 @@ class RateLimiter:
                     for ts, t in self.token_timestamps:
                         acc += t
                         if acc >= needed:
-                            wait_tpm = 60 - (now - ts)
+                            wait_tpm = 60 - (now - ts) + 1  # Add 1 second buffer
                             break
                     if wait_tpm < 0:
                         wait_tpm = 0.0
@@ -157,7 +210,8 @@ class RateLimiter:
                     self.daily_count += 1
                     return
                 
-                sleep_for = wait + random.uniform(0, 0.5)
+                # Longer sleep with more jitter for Railway
+                sleep_for = wait + random.uniform(1, 3)  # 1-3 seconds additional jitter
             
             print(f"RateLimiter sleeping for {sleep_for:.2f}s to respect Gemini RPM/TPM limits")
             time.sleep(sleep_for)
@@ -216,47 +270,59 @@ def _safe_call_with_semaphore(fn, *args, **kwargs):
             pass
 
 
-def _call_with_retries(fn, *args, max_attempts=3, base_backoff=2.0, **kwargs):  # Reduced attempts, increased backoff
+# Updated retry function with better error handling
+
+def _call_with_retries(fn, *args, max_attempts=5, base_backoff=3.0, **kwargs):  # More attempts, longer backoff
     """Call `fn(*args, **kwargs)` with retries on transient errors."""
     attempt = 0
     while True:
         attempt += 1
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            _RATE_LIMITER.mark_success()  # Mark successful request
+            return result
         except Exception as e:
             msg = str(e).lower()
             
             # Check for quota exhaustion specifically
-            if any(tok in msg for tok in ("resource has been exhausted", "quota exceeded", "quota exhausted")):
+            if any(tok in msg for tok in ("resource has been exhausted", "quota exceeded", "quota exhausted", "insufficient quota")):
                 print(f"Quota exhausted detected: {e}")
-                _RATE_LIMITER.mark_quota_exhausted(24)  # Mark as exhausted for 24 hours
+                _RATE_LIMITER.mark_quota_exhausted(24)
                 raise RuntimeError("API quota exhausted. Please check your Google AI Studio quota limits and billing.") from e
+            
+            # Check for authentication/permission errors (non-retryable)
+            if any(tok in msg for tok in ("unauthorized", "forbidden", "invalid api key", "permission denied")):
+                print(f"Authentication/permission error (non-retryable): {e}")
+                raise RuntimeError("API authentication error. Please check your GEMINI_API_KEY.") from e
             
             # Check for other retryable errors
             retryable = False
             if any(tok in msg for tok in ("429", "rate limit", "rate_limit", "too many requests", "temporarily unavailable", "unavailable", "deadlineexceeded", "deadline exceeded")):
                 retryable = True
-            if any(tok in msg for tok in ("timeout", "timed out", "connection reset", "connection aborted")):
+                _RATE_LIMITER.mark_failure()  # Track failure
+            if any(tok in msg for tok in ("timeout", "timed out", "connection reset", "connection aborted", "service unavailable", "internal error")):
                 retryable = True
                 
             if not retryable or attempt >= max_attempts:
+                _RATE_LIMITER.mark_failure()  # Track failure
+                if attempt >= max_attempts:
+                    print(f"Max attempts ({max_attempts}) reached. Last error: {e}")
                 raise
             
             # Handle server-provided Retry-After
             retry_after = _get_retry_after(e)
             if retry_after and retry_after > 0:
-                sleep_time = min(retry_after + 1.0, 300)  # Add 1s buffer
+                sleep_time = min(retry_after + 2.0, 300)  # Add 2s buffer instead of 1s
                 print(f"Rate limited (attempt {attempt}/{max_attempts}): {e}; waiting {sleep_time:.1f}s")
                 time.sleep(sleep_time)
                 continue
             
-            # Exponential backoff with longer delays
-            backoff = base_backoff * (2 ** (attempt - 1))
-            jitter = random.uniform(0, 0.5 * backoff)
+            # More conservative exponential backoff
+            backoff = base_backoff * (3 ** (attempt - 1))  # Use 3x instead of 2x
+            jitter = random.uniform(1, 2)  # More jitter
             sleep_time = min(backoff + jitter, 300)
             print(f"Transient error (attempt {attempt}/{max_attempts}): {e}; retrying in {sleep_time:.2f}s")
             time.sleep(sleep_time)
-
 
 def _extract_from_dict_embedding_field(d: Dict[str, Any]):
     """Handle dict shapes like {'embedding': [...]} or {'embedding': [[...], [...]]}"""
@@ -365,46 +431,30 @@ def _try_embed_via_embed_content(contents: List[str]):
 
 
 def _try_embed_via_embed_content_direct(contents: List[str]):
-    """Try embedding via genai.embed_content"""
+    """Try embedding via genai.embed_content (for google-generativeai 0.2.0)"""
     if hasattr(genai, 'embed_content'):
         fn = genai.embed_content
         try:
-            try:
-                estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                _RATE_LIMITER.acquire(estimated)
-                res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, content=contents, task_type="SEMANTIC_SIMILARITY")
-            except TypeError:
+            # For older google-generativeai API, call embed_content directly for each text
+            results = []
+            for content in contents:
                 try:
-                    estimated = sum(_estimate_tokens_for_text(t) for t in contents)
+                    estimated = _estimate_tokens_for_text(content)
                     _RATE_LIMITER.acquire(estimated)
-                    res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, content=contents, task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
-                except Exception:
-                    print("genai.embed_content signature:", inspect.signature(fn))
+                    res = _safe_call_with_semaphore(fn, 
+                        model="models/embedding-001", 
+                        content=content, 
+                        task_type="retrieval_document"
+                    )
+                    if hasattr(res, 'embedding'):
+                        results.append(res.embedding)
+                    else:
+                        print(f"No embedding attribute in result: {type(res)}")
+                        return None
+                except Exception as e:
+                    print(f"Failed embedding single content: {e}")
                     raise
-
-            # Parse common shapes
-            if isinstance(res, dict):
-                e = _extract_from_dict_embedding_field(res)
-                if e is not None:
-                    return e
-                if 'embeddings' in res:
-                    return [(it.get('values') or it.get('embedding') or it) for it in res['embeddings']]
-                if 'data' in res:
-                    out = []
-                    for d in res['data']:
-                        if isinstance(d, dict) and 'embedding' in d:
-                            out.append(d['embedding'])
-                    return out
-
-            if hasattr(res, 'embeddings'):
-                return [getattr(e, 'values', getattr(e, 'embedding', e)) for e in res.embeddings]
-            if hasattr(res, 'data'):
-                return [getattr(d, 'embedding', d.get('embedding')) for d in res.data]
-            if hasattr(res, 'embedding'):
-                emb_attr = getattr(res, 'embedding')
-                if isinstance(emb_attr, list) and len(emb_attr) and isinstance(emb_attr[0], (list, tuple)):
-                    return [list(inner) for inner in emb_attr]
-                return [list(emb_attr)]
+            return results
         except Exception as e:
             print("embed via genai.embed_content failed:", e)
             if "resource has been exhausted" in str(e).lower():
@@ -419,73 +469,168 @@ def embed_text(text: str) -> list:
 
 
 
-def _embed_single_batch(texts: List[str]) -> List[list]:
-    """Embed a single batch of texts using available methods."""
+# Replace your _embed_single_batch function with this debug version:
+
+# Modern embedding function for latest Google Generative AI API
+def _embed_single_batch_modern(texts: List[str]) -> List[list]:
+    """Embedding function using the latest Google Generative AI API."""
     if not texts:
         return []
-    if not _RATE_LIMITER.is_quota_available():
-        raise RuntimeError("API quota exhausted. Please check your Google AI Studio quota and try again later.")
-    for fn in (_try_embed_via_models, _try_embed_via_embed_content, _try_embed_via_embed_content_direct):
-        estimated_tokens = sum(_estimate_tokens_for_text(t) for t in texts)
-        print(f"[Embedding] Batch size: {len(texts)}, Estimated total tokens: {estimated_tokens}")
-        try:
-            res = fn(texts)
-            if res is not None:
-                normalized = []
-                for item in res:
-                    if isinstance(item, (list, tuple)):
-                        if len(item) and isinstance(item[0], (list, tuple)):
-                            if all(isinstance(x, (int, float)) for x in item):
-                                normalized.append([float(x) for x in item])
-                            else:
-                                for inner in item:
-                                    normalized.append([float(x) for x in inner])
-                            continue
-                        normalized.append([float(x) for x in item])
-                        continue
-                    if hasattr(item, 'values'):
-                        vals = getattr(item, 'values')
-                        normalized.append([float(x) for x in vals])
-                        continue
-                    if hasattr(item, 'embedding'):
-                        val = getattr(item, 'embedding')
-                        if isinstance(val, (list, tuple)):
-                            if len(val) and isinstance(val[0], (list, tuple)):
-                                for inner in val:
-                                    normalized.append([float(x) for x in inner])
-                            else:
-                                normalized.append([float(x) for x in val])
+    
+    print(f"[Embedding] Processing {len(texts)} texts with modern API...")
+    
+    try:
+        if HAS_NEW_API:
+            # Use the latest google.genai.Client API
+            client = new_genai.Client()
+            
+            # Estimate tokens and check rate limit
+            estimated = sum(_estimate_tokens_for_text(t) for t in texts)
+            _RATE_LIMITER.acquire(estimated)
+            
+            # Call the new API
+            result = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=texts,
+                config={
+                    "task_type": "SEMANTIC_SIMILARITY",
+                    "output_dimensionality": 768  # Optional: reduce dimensionality for efficiency
+                }
+            )
+            
+            print(f"[Embedding] Modern API response type: {type(result)}")
+            
+            if hasattr(result, 'embeddings'):
+                embeddings = []
+                for i, embedding in enumerate(result.embeddings):
+                    if hasattr(embedding, 'values'):
+                        embeddings.append(list(embedding.values))
+                        print(f"[Embedding] Processed embedding {i+1}: {len(embedding.values)} dimensions")
+                    else:
+                        raise RuntimeError(f"Embedding {i} has no 'values' attribute")
+                
+                print(f"[Embedding] Successfully processed {len(embeddings)} embeddings with modern API")
+                return embeddings
+            else:
+                raise RuntimeError(f"No 'embeddings' attribute in result: {type(result)}")
+        
+        else:
+            # Fallback to legacy API
+            print("[Embedding] Using legacy API...")
+            results = []
+            
+            for i, text in enumerate(texts):
+                estimated = _estimate_tokens_for_text(text)
+                _RATE_LIMITER.acquire(estimated)
+                
+                response = genai.embed_content(
+                    model="models/embedding-001",
+                    content=text,
+                    task_type="retrieval_document"
+                )
+                
+                print(f"[Embedding] Legacy API response type: {type(response)}")
+                print(f"[Embedding] Legacy API response attributes: {dir(response)}")
+                print(f"[Embedding] Legacy API response content: {str(response)[:200]}...")
+                
+                # Check multiple possible response structures
+                if hasattr(response, 'embedding'):
+                    results.append(list(response.embedding))
+                    print(f"[Embedding] Processed text {i+1}: {len(response.embedding)} dimensions")
+                elif hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+                    emb = response.embeddings[0]
+                    if hasattr(emb, 'values'):
+                        results.append(list(emb.values))
+                        print(f"[Embedding] Processed text {i+1} via embeddings[0].values: {len(emb.values)} dimensions")
+                    elif hasattr(emb, 'embedding'):
+                        results.append(list(emb.embedding))
+                        print(f"[Embedding] Processed text {i+1} via embeddings[0].embedding: {len(emb.embedding)} dimensions")
+                    else:
+                        results.append(list(emb))
+                        print(f"[Embedding] Processed text {i+1} via embeddings[0] directly: {len(emb)} dimensions")
+                elif isinstance(response, dict):
+                    if 'embedding' in response:
+                        results.append(list(response['embedding']))
+                        print(f"[Embedding] Processed text {i+1} via dict['embedding']: {len(response['embedding'])} dimensions")
+                    elif 'embeddings' in response and len(response['embeddings']) > 0:
+                        emb = response['embeddings'][0]
+                        if isinstance(emb, dict) and 'values' in emb:
+                            results.append(list(emb['values']))
+                            print(f"[Embedding] Processed text {i+1} via dict['embeddings'][0]['values']: {len(emb['values'])} dimensions")
                         else:
-                            raise RuntimeError(f"Unsupported embedding type inside .embedding: {type(val)}")
-                        continue
-                    if isinstance(item, dict) and 'embedding' in item:
-                        emb_val = item['embedding']
-                        if isinstance(emb_val, (list, tuple)):
-                            if len(emb_val) and isinstance(emb_val[0], (list, tuple)):
-                                for inner in emb_val:
-                                    normalized.append([float(x) for x in inner])
-                            else:
-                                normalized.append([float(x) for x in emb_val])
-                            continue
-                    try:
-                        normalized.append([float(x) for x in item])
-                    except Exception:
-                        raise RuntimeError(f"Unable to normalize embedding item: {type(item)} {str(item)[:200]}")
-                print(f"Embedding succeeded via {fn.__name__}")
-                return normalized
-        except Exception as e:
-            if "quota exhausted" in str(e).lower() or "resource has been exhausted" in str(e).lower():
-                raise
-            continue
-    raise RuntimeError("Failed to generate embedding: all methods exhausted or quota exceeded")
+                            results.append(list(emb))
+                            print(f"[Embedding] Processed text {i+1} via dict['embeddings'][0]: {len(emb)} dimensions")
+                    else:
+                        raise RuntimeError(f"Unknown dict response structure for text {i+1}: {response.keys()}")
+                else:
+                    raise RuntimeError(f"Unknown response structure for text {i+1}: {type(response)}, attributes: {dir(response)}")
+            
+            print(f"[Embedding] Successfully processed {len(results)} embeddings with legacy API")
+            return results
+            
+    except Exception as e:
+        print(f"[Embedding] Error in modern embedding: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+# Replace _embed_single_batch with the modern version
+def _embed_single_batch(texts: List[str]) -> List[list]:
+    return _embed_single_batch_modern(texts)
+
+
+# Also add this debug function to test a simple API call:
+def debug_simple_embedding_test():
+    """Test the simplest possible embedding call"""
+    print("🔍 Testing simple embedding call...")
+    try:
+        print(f"🔍 API Key present: {'GEMINI_API_KEY' in os.environ}")
+        print(f"🔍 API Key starts with: {os.getenv('GEMINI_API_KEY', '')[:10]}...")
+        
+        # Try the latest API first
+        if HAS_NEW_API:
+            print("🔍 Testing with latest API (google.genai.Client)")
+            client = new_genai.Client()
+            result = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=["Hello world"],
+                config={"task_type": "SEMANTIC_SIMILARITY"}
+            )
+            print(f"🔍 Latest API result type: {type(result)}")
+            if hasattr(result, 'embeddings'):
+                print(f"🔍 Embedding values length: {len(result.embeddings[0].values) if result.embeddings else 0}")
+            return True
+        else:
+            # Fallback to legacy API
+            print("🔍 Testing with legacy API (google.generativeai)")
+            result = genai.embed_content(
+                model="models/embedding-001",
+                content="Hello world",
+                task_type="retrieval_document"
+            )
+            print(f"🔍 Legacy API result type: {type(result)}")
+            if hasattr(result, 'embedding'):
+                print(f"🔍 Embedding values length: {len(result.embedding) if result.embedding else 0}")
+            return True
+    except Exception as e:
+        print(f"🔍 Simple test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Call this at the start of your processing:
+# debug_simple_embedding_test()
+# 2. In your embed_texts function, add delays between batches:
 
 def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
     """Embed multiple text strings, splitting into batches by token count."""
     if not texts:
         return []
+    
     batches = []
     current_batch = []
     current_tokens = 0
+    
     for text in texts:
         text_tokens = _estimate_tokens_for_text(text)
         if current_tokens + text_tokens > max_batch_tokens and current_batch:
@@ -495,12 +640,25 @@ def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
         else:
             current_batch.append(text)
             current_tokens += text_tokens
+    
     if current_batch:
         batches.append(current_batch)
+    
+    print(f"Processing {len(batches)} batches of embeddings")
+    
     all_embeddings = []
-    for batch in batches:
+    for i, batch in enumerate(batches):
+        print(f"Processing batch {i+1}/{len(batches)}")
+        
         batch_embeddings = _embed_single_batch(batch)
         all_embeddings.extend(batch_embeddings)
+        
+        # Add delay between batches (except after the last one)
+        if i < len(batches) - 1:
+            sleep_time = 1.5  # 1.5 seconds between batches
+            print(f"Waiting {sleep_time}s before next batch...")
+            time.sleep(sleep_time)
+    
     return all_embeddings
 
 

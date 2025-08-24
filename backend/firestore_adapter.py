@@ -10,23 +10,24 @@ COLLECTION_CHUNKS = os.getenv("FIRESTORE_EMBEDDINGS_COLLECTION", "chunks")
 COLLECTION_SUMMARIES = os.getenv("FIRESTORE_SUMMARIES_COLLECTION", "summaries")
 COLLECTION_QA = os.getenv("FIRESTORE_QA_COLLECTION", "qa_sessions")
 
-db = firestore.Client()
+# ❌ Remove this line - we'll pass db as parameter instead
+# db = firestore.Client()
 
-def add_document_metadata(doc: Dict[str, Any]) -> str:
+def add_document_metadata(db: firestore.Client, doc: Dict[str, Any]) -> str:
     ref = db.collection(COLLECTION_DOCUMENTS).add(doc)
     return ref[1].id
 
-def update_document_status(doc_id: str, status: str):
+def update_document_status(db: firestore.Client, doc_id: str, status: str):
     db.collection(COLLECTION_DOCUMENTS).document(doc_id).update({"status": status})
 
-def add_chunks(chunks: list):
+def add_chunks(db: firestore.Client, chunks: list):
     batch = db.batch()
     for chunk in chunks:
         ref = db.collection(COLLECTION_CHUNKS).document()
         batch.set(ref, chunk)
     batch.commit()
 
-def add_summary(summary: Dict[str, Any]):
+def add_summary(db: firestore.Client, summary: Dict[str, Any]):
     db.collection(COLLECTION_SUMMARIES).add(summary)
 
 def _serialize_firestore_session(data, doc_id):
@@ -47,7 +48,7 @@ def _serialize_firestore_session(data, doc_id):
     data["sessionId"] = doc_id  # For backward compatibility
     return data
 
-def add_qa_session(qa: Dict[str, Any]) -> str:
+def add_qa_session(db: firestore.Client, qa: Dict[str, Any]) -> str:
     """Add a new QA session and return its ID, setting session_id at creation."""
     temp_ref = db.collection(COLLECTION_QA).document()
     session_id = temp_ref.id
@@ -57,7 +58,7 @@ def add_qa_session(qa: Dict[str, Any]) -> str:
     temp_ref.set(qa)
     return session_id
 
-def get_qa_sessions_by_user(user_id: str):
+def get_qa_sessions_by_user(db: firestore.Client, user_id: str):
     """Get all QA sessions for a user, ordered by creation date."""
     sessions = []
     try:
@@ -75,7 +76,7 @@ def get_qa_sessions_by_user(user_id: str):
     
     return sessions
 
-def get_qa_session_by_id(session_id: str):
+def get_qa_session_by_id(db: firestore.Client, session_id: str):
     """Get a QA session by its ID."""
     try:
         doc = db.collection(COLLECTION_QA).document(session_id).get()
@@ -88,7 +89,7 @@ def get_qa_session_by_id(session_id: str):
     
     return None
 
-def update_qa_session_messages(session_id: str, new_messages: list):
+def update_qa_session_messages(db: firestore.Client, session_id: str, new_messages: list):
     """Append new messages to a QA session."""
     try:
         # Clean messages before storing
@@ -110,7 +111,7 @@ def update_qa_session_messages(session_id: str, new_messages: list):
         print(f"Error updating messages for session {session_id}: {e}")
         raise e
 
-def update_qa_session_field(session_id: str, field_name: str, field_value):
+def update_qa_session_field(db: firestore.Client, session_id: str, field_name: str, field_value):
     """Update a specific field in a QA session."""
     try:
         db.collection(COLLECTION_QA).document(session_id).update({
@@ -120,7 +121,7 @@ def update_qa_session_field(session_id: str, field_name: str, field_value):
         print(f"Error updating field {field_name} for session {session_id}: {e}")
         raise e
 
-def delete_qa_session(session_id: str):
+def delete_qa_session(db: firestore.Client, session_id: str):
     """Delete a QA session."""
     try:
         db.collection(COLLECTION_QA).document(session_id).delete()
@@ -128,7 +129,7 @@ def delete_qa_session(session_id: str):
         print(f"Error deleting session {session_id}: {e}")
         raise e
 
-def get_summary_by_doc_id(doc_id: str):
+def get_summary_by_doc_id(db: firestore.Client, doc_id: str):
     """Get document summary by document ID."""
     try:
         docs = db.collection(COLLECTION_SUMMARIES).where("documentId", "==", doc_id).stream()
@@ -139,7 +140,7 @@ def get_summary_by_doc_id(doc_id: str):
     
     return None
 
-def get_chunks_by_doc_id(doc_id: str):
+def get_chunks_by_doc_id(db: firestore.Client, doc_id: str):
     """
     Retrieve all chunks for a given document ID.
     Each chunk contains both the original text and the embedding.
