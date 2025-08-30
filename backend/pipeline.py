@@ -13,15 +13,8 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return text
 from typing import List, Dict, Any
 import inspect
-import google.generativeai as genai
-# Also import the new google.genai for latest API
-try:
-    from google import genai as new_genai
-    HAS_NEW_API = True
-    print("✅ Using latest Google Generative AI API")
-except ImportError:
-    HAS_NEW_API = False
-    print("⚠️ Using legacy Google Generative AI API")
+import google.genai as genai
+from google.genai.types import GenerateContentConfig
 import os
 import time
 import random
@@ -82,7 +75,9 @@ _GEMINI_MODEL = "gemini-embedding-001"
 _API_KEY = os.getenv("GEMINI_API_KEY")
 if not _API_KEY:
     raise RuntimeError("Google AI Studio API key not set in GEMINI_API_KEY")
-genai.configure(api_key=_API_KEY)
+
+# Initialize modern client
+client = genai.Client(api_key=_API_KEY)
 
 # --- Rate limiter with better quota handling ---
 _RPM = int(os.getenv("GEMINI_EMBEDDING_RPM", 5))  # Reduced from 100
@@ -91,8 +86,13 @@ _RPD = int(os.getenv("GEMINI_EMBEDDING_RPD", 100))   # Reduced from 1000
 
 
 def _pt_date_now():
-    if _HAS_ZONEINFO:
-        return datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    """Get current date in a timezone-safe way."""
+    try:
+        if _HAS_ZONEINFO:
+            return datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    except Exception:
+        # Fallback to UTC if timezone not available (Windows)
+        pass
     return (datetime.utcnow() - timedelta(hours=8)).date()
 
 
@@ -344,121 +344,81 @@ def _extract_from_dict_embedding_field(d: Dict[str, Any]):
 
 
 def _try_embed_via_models(contents: List[str]):
-    """Try embedding via genai.Client().models approach"""
-    if hasattr(genai, 'Client'):
-        try:
-            client = genai.Client()
-            fn = getattr(client.models, 'embed_content', None)
-            if fn:
-                try:
-                    estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                    _RATE_LIMITER.acquire(estimated)
-                    res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, contents=contents, config={"task_type": "SEMANTIC_SIMILARITY"})
-                except TypeError:
-                    try:
-                        estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                        _RATE_LIMITER.acquire(estimated)
-                        res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, content=contents, config={"task_type": "SEMANTIC_SIMILARITY"})
-                    except TypeError:
-                        estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                        _RATE_LIMITER.acquire(estimated)
-                        res = _safe_call_with_semaphore(fn, _GEMINI_MODEL, contents)
+    """Try embedding via modern client.models approach"""
+    try:
+        estimated = sum(_estimate_tokens_for_text(t) for t in contents)
+        _RATE_LIMITER.acquire(estimated)
+        res = _safe_call_with_semaphore(
+            client.models.embed_content,
+            model=_GEMINI_MODEL, 
+            contents=contents, 
+            config={"task_type": "SEMANTIC_SIMILARITY"}
+        )
 
-                # Parse possible shapes
-                if isinstance(res, dict):
-                    e = _extract_from_dict_embedding_field(res)
-                    if e is not None:
-                        return e
-                    if 'embeddings' in res:
-                        return [(it.get('values') or it.get('embedding') or it) for it in res['embeddings']]
-                    if 'data' in res:
-                        out = []
-                        for d in res['data']:
-                            if isinstance(d, dict) and 'embedding' in d:
-                                out.append(d['embedding'])
-                        return out
-                if hasattr(res, 'embeddings'):
-                    return [getattr(e, 'values', getattr(e, 'embedding', e)) for e in res.embeddings]
-                if hasattr(res, 'data'):
-                    return [getattr(d, 'embedding', d.get('embedding')) for d in res.data]
-        except Exception as e:
-            print("embed via genai.Client().models failed:", e)
-            if "resource has been exhausted" in str(e).lower():
-                raise  # Re-raise quota errors immediately
+        # Parse response
+        if hasattr(res, 'embeddings'):
+            return [getattr(e, 'values', getattr(e, 'embedding', e)) for e in res.embeddings]
+        elif isinstance(res, dict) and 'embeddings' in res:
+            return [(it.get('values') or it.get('embedding') or it) for it in res['embeddings']]
+        
+    except Exception as e:
+        print("embed via client.models failed:", e)
+        if "resource has been exhausted" in str(e).lower():
+            raise  # Re-raise quota errors immediately
     return None
 
 
 def _try_embed_via_embed_content(contents: List[str]):
-    """Try embedding via genai.models.embed_content"""
-    if hasattr(genai, 'models') and hasattr(genai.models, 'embed_content'):
-        fn = genai.models.embed_content
-        try:
-            try:
-                estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                _RATE_LIMITER.acquire(estimated)
-                res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, contents=contents, config={"task_type": "SEMANTIC_SIMILARITY"})
-            except TypeError:
-                try:
-                    estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                    _RATE_LIMITER.acquire(estimated)
-                    res = _safe_call_with_semaphore(fn, model=_GEMINI_MODEL, content=contents, config={"task_type": "SEMANTIC_SIMILARITY"})
-                except TypeError:
-                    estimated = sum(_estimate_tokens_for_text(t) for t in contents)
-                    _RATE_LIMITER.acquire(estimated)
-                    res = _safe_call_with_semaphore(fn, _GEMINI_MODEL, contents)
+    """Try embedding via client.models.embed_content fallback"""
+    try:
+        estimated = sum(_estimate_tokens_for_text(t) for t in contents)
+        _RATE_LIMITER.acquire(estimated)
+        res = _safe_call_with_semaphore(
+            client.models.embed_content,
+            model=_GEMINI_MODEL,
+            contents=contents,
+            config={"task_type": "SEMANTIC_SIMILARITY"}
+        )
 
-            if isinstance(res, dict):
-                e = _extract_from_dict_embedding_field(res)
-                if e is not None:
-                    return e
-                if 'embeddings' in res:
-                    return [(it.get('values') or it.get('embedding') or it) for it in res['embeddings']]
-                if 'data' in res:
-                    out = []
-                    for d in res['data']:
-                        if isinstance(d, dict) and 'embedding' in d:
-                            out.append(d['embedding'])
-                    return out
-            if hasattr(res, 'embeddings'):
-                return [getattr(e, 'values', getattr(e, 'embedding', e)) for e in res.embeddings]
-            if hasattr(res, 'data'):
-                return [getattr(d, 'embedding', d.get('embedding')) for d in res.data]
-        except Exception as e:
-            print("embed via genai.models.embed_content failed:", e)
-            if "resource has been exhausted" in str(e).lower():
-                raise
+        if hasattr(res, 'embeddings'):
+            return [getattr(e, 'values', getattr(e, 'embedding', e)) for e in res.embeddings]
+        elif isinstance(res, dict) and 'embeddings' in res:
+            return [(it.get('values') or it.get('embedding') or it) for it in res['embeddings']]
+            
+    except Exception as e:
+        print("embed via client.models.embed_content failed:", e)
+        if "resource has been exhausted" in str(e).lower():
+            raise
     return None
 
 
 def _try_embed_via_embed_content_direct(contents: List[str]):
-    """Try embedding via genai.embed_content (for google-generativeai 0.2.0)"""
-    if hasattr(genai, 'embed_content'):
-        fn = genai.embed_content
-        try:
-            # For older google-generativeai API, call embed_content directly for each text
-            results = []
-            for content in contents:
-                try:
-                    estimated = _estimate_tokens_for_text(content)
-                    _RATE_LIMITER.acquire(estimated)
-                    res = _safe_call_with_semaphore(fn, 
-                        model="models/embedding-001", 
-                        content=content, 
-                        task_type="retrieval_document"
-                    )
-                    if hasattr(res, 'embedding'):
-                        results.append(res.embedding)
-                    else:
-                        print(f"No embedding attribute in result: {type(res)}")
-                        return None
-                except Exception as e:
-                    print(f"Failed embedding single content: {e}")
-                    raise
-            return results
-        except Exception as e:
-            print("embed via genai.embed_content failed:", e)
-            if "resource has been exhausted" in str(e).lower():
-                raise
+    """Try embedding via direct client calls for each content"""
+    try:
+        results = []
+        for content in contents:
+            estimated = _estimate_tokens_for_text(content)
+            _RATE_LIMITER.acquire(estimated)
+            res = _safe_call_with_semaphore(
+                client.models.embed_content,
+                model=_GEMINI_MODEL,
+                contents=[content],
+                config={"task_type": "SEMANTIC_SIMILARITY"}
+            )
+            if hasattr(res, 'embeddings') and len(res.embeddings) > 0:
+                embedding = res.embeddings[0]
+                if hasattr(embedding, 'values'):
+                    results.append(embedding.values)
+                else:
+                    results.append(embedding)
+            else:
+                print(f"No embedding found in result: {type(res)}")
+                return None
+        return results
+    except Exception as e:
+        print("embed via direct client calls failed:", e)
+        if "resource has been exhausted" in str(e).lower():
+            raise
     return None
 
 
@@ -480,93 +440,35 @@ def _embed_single_batch_modern(texts: List[str]) -> List[list]:
     print(f"[Embedding] Processing {len(texts)} texts with modern API...")
     
     try:
-        if HAS_NEW_API:
-            # Use the latest google.genai.Client API
-            client = new_genai.Client()
-            
-            # Estimate tokens and check rate limit
-            estimated = sum(_estimate_tokens_for_text(t) for t in texts)
-            _RATE_LIMITER.acquire(estimated)
-            
-            # Call the new API
-            result = client.models.embed_content(
-                model="gemini-embedding-001",
-                contents=texts,
-                config={
-                    "task_type": "SEMANTIC_SIMILARITY",
-                    "output_dimensionality": 768  # Optional: reduce dimensionality for efficiency
-                }
-            )
-            
-            print(f"[Embedding] Modern API response type: {type(result)}")
-            
-            if hasattr(result, 'embeddings'):
-                embeddings = []
-                for i, embedding in enumerate(result.embeddings):
-                    if hasattr(embedding, 'values'):
-                        embeddings.append(list(embedding.values))
-                        print(f"[Embedding] Processed embedding {i+1}: {len(embedding.values)} dimensions")
-                    else:
-                        raise RuntimeError(f"Embedding {i} has no 'values' attribute")
-                
-                print(f"[Embedding] Successfully processed {len(embeddings)} embeddings with modern API")
-                return embeddings
-            else:
-                raise RuntimeError(f"No 'embeddings' attribute in result: {type(result)}")
+        # Use the modern google.genai.Client API
+        estimated = sum(_estimate_tokens_for_text(t) for t in texts)
+        _RATE_LIMITER.acquire(estimated)
         
-        else:
-            # Fallback to legacy API
-            print("[Embedding] Using legacy API...")
-            results = []
-            
-            for i, text in enumerate(texts):
-                estimated = _estimate_tokens_for_text(text)
-                _RATE_LIMITER.acquire(estimated)
-                
-                response = genai.embed_content(
-                    model="models/embedding-001",
-                    content=text,
-                    task_type="retrieval_document"
-                )
-                
-                print(f"[Embedding] Legacy API response type: {type(response)}")
-                print(f"[Embedding] Legacy API response attributes: {dir(response)}")
-                print(f"[Embedding] Legacy API response content: {str(response)[:200]}...")
-                
-                # Check multiple possible response structures
-                if hasattr(response, 'embedding'):
-                    results.append(list(response.embedding))
-                    print(f"[Embedding] Processed text {i+1}: {len(response.embedding)} dimensions")
-                elif hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                    emb = response.embeddings[0]
-                    if hasattr(emb, 'values'):
-                        results.append(list(emb.values))
-                        print(f"[Embedding] Processed text {i+1} via embeddings[0].values: {len(emb.values)} dimensions")
-                    elif hasattr(emb, 'embedding'):
-                        results.append(list(emb.embedding))
-                        print(f"[Embedding] Processed text {i+1} via embeddings[0].embedding: {len(emb.embedding)} dimensions")
-                    else:
-                        results.append(list(emb))
-                        print(f"[Embedding] Processed text {i+1} via embeddings[0] directly: {len(emb)} dimensions")
-                elif isinstance(response, dict):
-                    if 'embedding' in response:
-                        results.append(list(response['embedding']))
-                        print(f"[Embedding] Processed text {i+1} via dict['embedding']: {len(response['embedding'])} dimensions")
-                    elif 'embeddings' in response and len(response['embeddings']) > 0:
-                        emb = response['embeddings'][0]
-                        if isinstance(emb, dict) and 'values' in emb:
-                            results.append(list(emb['values']))
-                            print(f"[Embedding] Processed text {i+1} via dict['embeddings'][0]['values']: {len(emb['values'])} dimensions")
-                        else:
-                            results.append(list(emb))
-                            print(f"[Embedding] Processed text {i+1} via dict['embeddings'][0]: {len(emb)} dimensions")
-                    else:
-                        raise RuntimeError(f"Unknown dict response structure for text {i+1}: {response.keys()}")
+        # Call the modern API
+        result = client.models.embed_content(
+            model=_GEMINI_MODEL,
+            contents=texts,
+            config={
+                "task_type": "SEMANTIC_SIMILARITY",
+                "output_dimensionality": 768  # Optional: reduce dimensionality for efficiency
+            }
+        )
+        
+        print(f"[Embedding] Modern API response type: {type(result)}")
+        
+        if hasattr(result, 'embeddings'):
+            embeddings = []
+            for i, embedding in enumerate(result.embeddings):
+                if hasattr(embedding, 'values'):
+                    embeddings.append(list(embedding.values))
+                    print(f"[Embedding] Processed embedding {i+1}: {len(embedding.values)} dimensions")
                 else:
-                    raise RuntimeError(f"Unknown response structure for text {i+1}: {type(response)}, attributes: {dir(response)}")
+                    raise RuntimeError(f"Embedding {i} has no 'values' attribute")
             
-            print(f"[Embedding] Successfully processed {len(results)} embeddings with legacy API")
-            return results
+            print(f"[Embedding] Successfully processed {len(embeddings)} embeddings with modern API")
+            return embeddings
+        else:
+            raise RuntimeError(f"No 'embeddings' attribute in result: {type(result)}")
             
     except Exception as e:
         print(f"[Embedding] Error in modern embedding: {e}")
@@ -587,31 +489,17 @@ def debug_simple_embedding_test():
         print(f"🔍 API Key present: {'GEMINI_API_KEY' in os.environ}")
         print(f"🔍 API Key starts with: {os.getenv('GEMINI_API_KEY', '')[:10]}...")
         
-        # Try the latest API first
-        if HAS_NEW_API:
-            print("🔍 Testing with latest API (google.genai.Client)")
-            client = new_genai.Client()
-            result = client.models.embed_content(
-                model="gemini-embedding-001",
-                contents=["Hello world"],
-                config={"task_type": "SEMANTIC_SIMILARITY"}
-            )
-            print(f"🔍 Latest API result type: {type(result)}")
-            if hasattr(result, 'embeddings'):
-                print(f"🔍 Embedding values length: {len(result.embeddings[0].values) if result.embeddings else 0}")
-            return True
-        else:
-            # Fallback to legacy API
-            print("🔍 Testing with legacy API (google.generativeai)")
-            result = genai.embed_content(
-                model="models/embedding-001",
-                content="Hello world",
-                task_type="retrieval_document"
-            )
-            print(f"🔍 Legacy API result type: {type(result)}")
-            if hasattr(result, 'embedding'):
-                print(f"🔍 Embedding values length: {len(result.embedding) if result.embedding else 0}")
-            return True
+        # Test with modern API
+        print("🔍 Testing with modern API (google.genai.Client)")
+        result = client.models.embed_content(
+            model=_GEMINI_MODEL,
+            contents=["Hello world"],
+            config={"task_type": "SEMANTIC_SIMILARITY"}
+        )
+        print(f"🔍 Modern API result type: {type(result)}")
+        if hasattr(result, 'embeddings'):
+            print(f"🔍 Embedding values length: {len(result.embeddings[0].values) if result.embeddings else 0}")
+        return True
     except Exception as e:
         print(f"🔍 Simple test failed: {e}")
         import traceback
@@ -664,9 +552,8 @@ def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
 
 # --- Summarization (real) ---
 import re, json
-import google.generativeai as genai
 
-_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", "gemini-1.5-flash")
+_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", "gemini-2.5-flash")
 _MAX_SUMMARY_CHUNKS = int(os.getenv("SUMMARY_MAX_CHUNKS", 12))   # cap cost/time
 _PER_CHUNK_WORDS = int(os.getenv("SUMMARY_PER_CHUNK_WORDS", 28)) # brevity target
 
@@ -674,7 +561,7 @@ def _summarize_one_chunk(text: str) -> str:
     """Return one concise bullet (string) for a chunk."""
     if not text.strip():
         return ""
-    model = genai.GenerativeModel(_SUMMARY_MODEL)
+    
     prompt = (
         "Summarize the following legal text as ONE short bullet "
         f"(≤{_PER_CHUNK_WORDS} words). Focus on obligations, fees, "
@@ -683,7 +570,12 @@ def _summarize_one_chunk(text: str) -> str:
         f"---\n{text}\n---"
     )
     try:
-        resp = model.generate_content(prompt)
+        config = GenerateContentConfig(temperature=0.3)  # Creative for summaries
+        resp = client.models.generate_content(
+            model=_SUMMARY_MODEL,
+            contents=prompt,
+            config=config
+        )
         bullet = (resp.text or "").strip()
         bullet = re.sub(r"^[\-•\s]+", "", bullet)  # strip leading bullet chars
         return bullet
@@ -696,14 +588,19 @@ def _infer_risks_from_bullets(bullets: list[str]) -> list[dict]:
     bullets_clean = "\n".join(f"- {b}" for b in bullets if b)
     if not bullets_clean.strip():
         return []
-    model = genai.GenerativeModel(_SUMMARY_MODEL)
+    
     prompt = (
         "Given these bullets extracted from a legal document, identify up to 3 potential risks. "
         "Return ONLY a JSON array, where each item has keys 'label' and 'explanation'.\n\n"
         f"{bullets_clean}\n\nJSON:"
     )
     try:
-        resp = model.generate_content(prompt)
+        config = GenerateContentConfig(temperature=0.2)  # Consistent for analysis
+        resp = client.models.generate_content(
+            model=_SUMMARY_MODEL,
+            contents=prompt,
+            config=config
+        )
         txt = (resp.text or "").strip()
         # try to extract JSON array
         m = re.search(r"\[\s*{.*}\s*\]", txt, flags=re.S)

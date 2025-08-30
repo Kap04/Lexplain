@@ -26,11 +26,26 @@ const auth = getAuth(app);
 
 export default function ChatPage() {
   const [user, setUser] = useState<User | null>(null);
-  const [showUpload, setShowUpload] = useState(true);
   const [showProfileDropdown, setShowProfileDropdown] = useState(false);
   const router = useRouter();
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
+
+  // Function to get greeting based on Indian time
+  const getGreeting = () => {
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
+    const istTime = new Date(now.getTime() + istOffset);
+    const hour = istTime.getUTCHours();
+    
+    if (hour < 12) {
+      return "Good morning";
+    } else if (hour < 17) {
+      return "Good afternoon";
+    } else {
+      return "Good evening";
+    }
+  };
 
   const handleSignIn = async () => {
     await signInWithPopup(auth, new GoogleAuthProvider());
@@ -61,7 +76,47 @@ export default function ChatPage() {
     
     // Navigate to the new session
     router.push(`/chat/${data.session_id}`);
-    setShowUpload(false);
+  };
+
+  const handleComparisonReady = (docIds: string[]) => {
+    if (!user || docIds.length < 2) return;
+    
+    // Create a comparison session and navigate to it
+    createComparisonSession(docIds);
+  };
+
+  const createComparisonSession = async (docIds: string[]) => {
+    if (!user || docIds.length < 2) return;
+    
+    try {
+      const idToken = await user.getIdToken();
+      
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/session`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify({
+          type: "comparison",
+          document_ids: docIds,
+          title: `Document Comparison (${docIds.length} docs)`
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to create comparison session");
+      }
+
+      const { session_id } = await response.json();
+      console.log(`Created comparison session: ${session_id} for documents: ${docIds.join(', ')}`);
+      
+      // Navigate to the comparison session
+      router.push(`/chat/${session_id}`);
+      
+    } catch (error) {
+      console.error("Error creating comparison session:", error);
+    }
   };
 
   const handleSelectSession = (sessionId: string) => {
@@ -148,22 +203,26 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* Document upload section */}
-        {showUpload && (
-          <div className="p-4">
-            <DocumentUpload onUpload={handleUpload} user={user} />
+        {/* Main content - centered */}
+        <div className="flex-1 flex flex-col items-center justify-center p-8 max-w-2xl mx-auto w-full">
+          {/* Greeting */}
+          <h1 className="text-5xl font-bold text-gray-800 mb-8">
+            {getGreeting()}, {user.displayName?.split(' ')[0] || 'there'}!
+          </h1>
+          
+          {/* Document Upload Component */}
+          <div className="w-full mb-6">
+            <DocumentUpload 
+              onUpload={handleUpload} 
+              onComparisonReady={handleComparisonReady}
+              user={user} 
+            />
           </div>
-        )}
-
-        {/* Welcome message */}
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center">
-            <h2 className="text-2xl font-bold text-gray-700 mb-4">Welcome to Lexplain</h2>
-            <p className="text-gray-500 mb-6">Upload a document to start a new chat session</p>
-            <button onClick={handleNewChat} className="btn btn-primary">
-              Start New Chat
-            </button>
-          </div>
+          
+          {/* Bottom message */}
+          <p className="text-sm text-gray-500 text-center">
+            Upload your legal document to demystify it
+          </p>
         </div>
       </div>
     </div>

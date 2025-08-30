@@ -89,6 +89,14 @@ h1,h2,h3,h4 { @apply font-semibold tracking-tight; color: #1F2937; }
 }
 .btn-accent:hover { background: var(--color-accent-600); }
 
+/* Secondary (Gray) */
+.btn-secondary {
+  @apply text-sm;
+  background: #6b7280;
+  color: white;
+}
+.btn-secondary:hover { background: #4b5563; }
+
 /* Outline (for secondary actions) */
 .btn-outline {
   @apply border text-sm;

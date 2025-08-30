@@ -50,3 +50,8 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints
+
+# Python virtual environment
+.venv/
+venv/
+
