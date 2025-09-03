@@ -4,6 +4,8 @@ import Image from "next/image";
 import { InteractiveHoverButton } from "@/components/magicui/interactive-hover-button";
 import { SparklesText } from "@/components/magicui/sparkles-text";
 import { motion } from "framer-motion";
+import { HyperText } from "@/components/magicui/hyper-text";
+import { Span } from "next/dist/trace";
 
 export default function Home() {
   return (
@@ -13,14 +15,9 @@ export default function Home() {
         {/* Text Section */}
         <div className="max-w-2xl col-span-1 flex flex-col justify-center h-full">
           <h1 className="text-7xl font-bold text-gray-900 leading-tight">
-            <motion.span
-              initial={{ filter: "blur(8px)", opacity: 0 }}
-              animate={{ filter: "blur(0px)", opacity: 1 }}
-              transition={{ duration: 1.8, ease: "easeOut" }}
-              className="font-bold"
-            >
+            <HyperText duration={1000} className="text-7xl font-bold">
               Demystrify
-            </motion.span>
+            </HyperText>
             {" "}Legal Documents with <SparklesText className="text-[#7C3AED]">AI</SparklesText>
           </h1>
           <p className="mt-6 text-2xl text-gray-600">
@@ -32,7 +29,7 @@ export default function Home() {
             </span>
           </p>
           <div className="flex justify-end md:justify-end pr-20">
-            <Link href="/chat/new">
+            <Link href="/auth">
               <InteractiveHoverButton className="mt-10 px-8 py-4 cursor-pointer bg-yellow-700 text-white text-xl rounded-lg hover:bg-yellow-800 transition">
                 Get Started
               </InteractiveHoverButton>
@@ -46,8 +43,8 @@ export default function Home() {
             <Image
               src="/landing_page.png"
               alt="Lexplain Bot"
-              width={700}
-              height={700}
+              width={500}
+              height={500}
               className="rounded-lg"
             />
             <div className="absolute inset-0 rounded-lg pointer-events-none bg-gradient-to-r from-white via-transparent to-white opacity-25"></div>

@@ -192,9 +192,11 @@ def delete_chat_session(session_id: str, user=Depends(verify_firebase_token)):
     delete_qa_session(db, session_id)
     return {"success": True}
 
-# --- PDF Content Extraction Helpers (PyMuPDF) ---
+# --- PDF Content Extraction Helpers (PyMuPDF + OCR) ---
 import fitz  # PyMuPDF
 import io
+import tempfile
+import os
 
 def extract_pages_from_pdf_content(content) -> List[Dict[str, Any]]:
     """Extract text from PDF file bytes using PyMuPDF."""
@@ -212,10 +214,126 @@ def extract_pages_from_pdf_content(content) -> List[Dict[str, Any]]:
     pages = []
     for i in range(len(doc)):
         p = doc[i]
-        text = p.get_text("text") or p.get_text("blocks") or p.get_text("dict") or ""
+        # Try different text extraction methods, ensuring we get strings
+        text = ""
+        try:
+            text = p.get_text("text")
+        except:
+            try:
+                # Fallback to blocks method, but extract text properly
+                blocks = p.get_text("blocks")
+                if isinstance(blocks, list):
+                    text = "\n".join(block[4] if isinstance(block, (list, tuple)) and len(block) > 4 else str(block) for block in blocks)
+                else:
+                    text = str(blocks)
+            except:
+                try:
+                    # Last resort: get_text without parameters
+                    text = p.get_text() or ""
+                except:
+                    text = ""
+        
         pages.append({"page": i+1, "text": text})
     doc.close()
     return pages
+
+def truncate_content_for_firestore(content: str, max_bytes: int = 900000) -> str:
+    """
+    Truncate content to fit within Firestore document size limits
+    
+    Args:
+        content: Text content to truncate
+        max_bytes: Maximum size in bytes (default 900KB, leaving room for other fields)
+    
+    Returns:
+        Truncated content
+    """
+    if not content:
+        return content
+    
+    # Convert to bytes to check size
+    content_bytes = content.encode('utf-8')
+    
+    if len(content_bytes) <= max_bytes:
+        return content
+    
+    # Truncate to fit within limit
+    # We'll cut at character boundaries to avoid encoding issues
+    truncated_content = content[:max_bytes // 2]  # Conservative estimate
+    
+    # Try to find a good break point (end of sentence or paragraph)
+    for break_char in ['\n\n', '\n', '. ', '? ', '! ']:
+        last_break = truncated_content.rfind(break_char)
+        if last_break > max_bytes // 4:  # Don't truncate too aggressively
+            truncated_content = truncated_content[:last_break + len(break_char)]
+            break
+    
+    # Add truncation notice
+    truncated_content += "\n\n[Content truncated due to size limits. Full content processed for analysis.]"
+    
+    return truncated_content
+
+def extract_text_with_ocr_support(content, filename: str = "document.pdf") -> tuple[str, str]:
+    """
+    Extract text from PDF with OCR fallback support
+    
+    Returns:
+        tuple: (extracted_text, extraction_method)
+    """
+    try:
+        # First, try the existing method
+        pages = extract_pages_from_pdf_content(content)
+        extracted_text = "\n\n".join(page["text"] for page in pages)
+        
+        # Check if we got meaningful text
+        text_quality = len(extracted_text.strip().replace('\n', '').replace(' ', ''))
+        
+        if text_quality > 100:  # Good text extraction
+            print(f"✅ Text-based extraction successful: {text_quality} characters")
+            return extracted_text, "text_based"
+        else:
+            print(f"⚠️ Poor text extraction ({text_quality} chars), trying OCR...")
+            # Fallback to OCR
+            return _extract_with_ocr_fallback(content, filename)
+            
+    except Exception as e:
+        print(f"❌ Text-based extraction failed: {e}, trying OCR...")
+        # Fallback to OCR
+        return _extract_with_ocr_fallback(content, filename)
+
+def _extract_with_ocr_fallback(content, filename: str) -> tuple[str, str]:
+    """
+    Extract text using OCR as fallback
+    """
+    try:
+        # Import OCR processor
+        from ocr_processor import extract_text_with_ocr
+        
+        # Save content to temporary file for OCR processing
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
+        
+        try:
+            # Use OCR processor
+            extracted_text, method = extract_text_with_ocr(temp_path)
+            print(f"✅ OCR extraction successful: {len(extracted_text)} characters using {method}")
+            return extracted_text, f"ocr_{method}"
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+                
+    except Exception as e:
+        print(f"❌ OCR extraction also failed: {e}")
+        # Last resort: return as plain text
+        try:
+            text = content.decode('utf-8', errors='ignore')
+            return text, "plain_text_fallback"
+        except:
+            return "Could not extract text from document", "extraction_failed"
 
 
 def _create_combined_summary(summary_data: Dict[str, Any]) -> str:
@@ -269,13 +387,23 @@ async def upload_document_content(
 ):
     print(f"Uploading document: {file.filename} for user: {user['uid']}")
     content = await file.read()
+    
     try:
-        pages = extract_pages_from_pdf_content(content)
-        extracted_text = "\n\n".join(page["text"] for page in pages)
-        print(f"Extracted {len(pages)} pages from PDF. Preview: {extracted_text[:200]}")
+        # Use OCR-aware text extraction
+        extracted_text, extraction_method = extract_text_with_ocr_support(content, file.filename)
+        
+        # Truncate content if too large for Firestore
+        original_length = len(extracted_text)
+        extracted_text = truncate_content_for_firestore(extracted_text)
+        
+        if len(extracted_text) < original_length:
+            print(f"⚠️ Content truncated from {original_length} to {len(extracted_text)} characters for Firestore storage")
+        
+        print(f"✅ Text extraction successful using {extraction_method}. Preview: {extracted_text[:200]}")
     except Exception as e:
-        print(f"PDF extraction failed: {e}. Treating as plain text.")
-        extracted_text = content.decode('utf-8', errors='ignore')
+        print(f"❌ All text extraction methods failed: {e}. Using fallback.")
+        extracted_text = "Error: Could not extract text from document"
+        extraction_method = "extraction_failed"
 
     doc = {
         "ownerId": user["uid"],
@@ -283,6 +411,7 @@ async def upload_document_content(
         "status": "uploaded",
         "createdAt": firestore.SERVER_TIMESTAMP,
         "documentContent": extracted_text,
+        "extractionMethod": extraction_method,  # Track how text was extracted
     }
     doc_id = add_document_metadata(db, doc)  # Pass db
     print(f"Document stored with ID: {doc_id}")
@@ -295,7 +424,7 @@ async def upload_document_content(
     except Exception as e:
         print(f"Failed to start background thread for processing: {e}")
 
-    return {"document_id": doc_id, "status": "uploaded"}
+    return {"document_id": doc_id, "status": "uploaded", "extraction_method": extraction_method}
 
 
 
@@ -1739,7 +1868,7 @@ def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends
     client = genai.Client(api_key=_API_KEY)
     
     context = "\n".join(selected_texts)
-    prompt = f"Context: {context}\nQuestion: {data['text']}\nAnswer in plain English in ≤ 120 words. If uncertain, respond 'I don't know — please consult a lawyer' and show the top 2 source snippets used."
+    prompt = f"Context: {context}\nQuestion: {data['text']}\nAnswer in markdown format in ≤ 120 words. Use appropriate markdown formatting like **bold**, *italic*, `code`, bullet points, etc. If uncertain, respond 'I don't know — please consult a lawyer' and show the top 2 source snippets used."
     
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -1770,6 +1899,105 @@ def add_message_to_session(session_id: str, data: dict = Body(...), user=Depends
         "messages": [user_message, ai_message],
         "session": updated_session  # Include updated session info
     }
+
+from fastapi.responses import StreamingResponse
+import json
+
+@app.post("/api/chat/session/{session_id}/message/stream")
+def stream_message_response(session_id: str, data: dict = Body(...), user=Depends(verify_firebase_token)):
+    """Stream AI response for a chat message."""
+    session = get_qa_session_by_id(db, session_id)
+    if not session or session.get("userId") != user["uid"]:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    document_id = session["documentId"]
+    
+    # Check if this is the first message to generate title
+    is_first_message = len(session.get("messages", [])) == 0
+    
+    # Create user message with current timestamp
+    current_time = datetime.utcnow().isoformat()
+    user_message = {
+        "role": "user", 
+        "text": data["text"], 
+        "timestamp": current_time
+    }
+    
+    def generate_stream():
+        try:
+            # Generate AI response
+            chunks = get_chunks_by_doc_id(db, document_id)
+            chunk_texts = [c["text"] for c in chunks]
+            chunk_embs = [c["embedding"] for c in chunks]
+            query_emb = embed_text(data["text"])
+            sim_scores = [cosine_similarity(query_emb, emb) for emb in chunk_embs]
+            pool_size = min(50, len(chunks))
+            top_pool_idxs = sorted(range(len(sim_scores)), key=lambda i: sim_scores[i], reverse=True)[:pool_size]
+            pool_embs = [chunk_embs[i] for i in top_pool_idxs]
+            pool_texts = [chunk_texts[i] for i in top_pool_idxs]
+            K = min(8, len(pool_embs))
+            selected_idxs = mmr(query_emb, pool_embs, K=K, lambda_=0.7)
+            selected_texts = [pool_texts[i] for i in selected_idxs]
+            
+            from google import genai
+            from google.genai import types
+            
+            _API_KEY = os.getenv("GEMINI_API_KEY")
+            client = genai.Client(api_key=_API_KEY)
+            
+            context = "\n".join(selected_texts)
+            prompt = f"Context: {context}\nQuestion: {data['text']}\nAnswer in markdown format in ≤ 120 words. Use appropriate markdown formatting like **bold**, *italic*, `code`, bullet points, etc. If uncertain, respond 'I don't know — please consult a lawyer' and show the top 2 source snippets used."
+            
+            # Send user message first
+            yield f"data: {json.dumps({'type': 'user_message', 'message': user_message})}\n\n"
+            
+            # Stream AI response
+            response_stream = client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1
+                )
+            )
+            
+            accumulated_text = ""
+            for chunk in response_stream:
+                if chunk.text:
+                    accumulated_text += chunk.text
+                    yield f"data: {json.dumps({'type': 'ai_chunk', 'chunk': chunk.text, 'accumulated': accumulated_text})}\n\n"
+            
+            # Create final AI message
+            ai_message = {
+                "role": "ai",
+                "text": accumulated_text,
+                "timestamp": current_time
+            }
+            
+            # Update session with new messages
+            update_qa_session_messages(db, session_id, [user_message, ai_message])
+            
+            # Generate and update title if this is the first message
+            updated_session = session
+            if is_first_message:
+                new_title = generate_title_from_message(data["text"])
+                update_qa_session_field(db, session_id, "title", new_title)
+                updated_session = get_qa_session_by_id(db, session_id)
+            
+            # Send completion message
+            yield f"data: {json.dumps({'type': 'complete', 'ai_message': ai_message, 'session': updated_session})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+        }
+    )
 
 @app.get("/api/documents/{doc_id}/status")
 def get_document_status(doc_id: str, user=Depends(verify_firebase_token)):

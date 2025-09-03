@@ -18,6 +18,8 @@ import ArtifactPanel from "../../../components/ArtifactPanel";
 import ComparisonArtifactCard from "../../../components/ComparisonArtifactCard";
 import { LegalAnalysisData } from "../../../components/ArtifactCard";
 import { ComparisonData } from "../../../components/ComparisonArtifactCard";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -49,6 +51,14 @@ export default function ChatSessionPage() {
   const [sessionLoading, setSessionLoading] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   
+  // Document processing status
+  const [documentStatus, setDocumentStatus] = useState<'processing' | 'ready' | 'error'>('processing');
+  const [processingMessage, setProcessingMessage] = useState('Starting document analysis...');
+  
+  // Streaming state
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingMessage, setStreamingMessage] = useState('');
+  
   // Artifact system state
   const [artifacts, setArtifacts] = useState<LegalAnalysisData[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState<LegalAnalysisData | null>(null);
@@ -79,6 +89,39 @@ export default function ChatSessionPage() {
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
 
+  // Function to check document status via HTTP (fallback)
+  const checkDocumentStatus = async (documentId: string) => {
+    if (!user) return;
+    
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/documents/${documentId}/status`, {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      
+      if (response.ok) {
+        const statusData = await response.json();
+        console.log('📊 HTTP status check result:', statusData);
+        
+        if (statusData.status === 'processed' || statusData.status === 'ready') {
+          console.log('✅ Document is ready! (via HTTP check)');
+          setDocumentStatus('ready');
+          setProcessingMessage('Document analysis complete! Ready for legal insights.');
+        } else if (statusData.status === 'error' || statusData.status === 'failed') {
+          console.log('❌ Document has error! (via HTTP check)');
+          setDocumentStatus('error');
+          setProcessingMessage('Error processing document. Please try again.');
+        } else {
+          console.log('🔄 Document still processing... (via HTTP check)');
+          setDocumentStatus('processing');
+          setProcessingMessage(statusData.message || 'Processing document...');
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error checking document status:', error);
+    }
+  };
+
   // Fetch session data
   useEffect(() => {
     if (!sessionId || !user) return;
@@ -96,6 +139,15 @@ export default function ChatSessionPage() {
           setSession(data);
           setMessages(data.messages || []);
           setDocId(data.documentId || null);
+          
+          // Set initial document status - assume processing if document exists but no explicit status
+          if (data.documentId) {
+            setDocumentStatus('processing');
+            setProcessingMessage('Starting document analysis...');
+            
+            // Also try to get current document status via HTTP
+            checkDocumentStatus(data.documentId);
+          }
           
           // Check if this is a comparison session
           if (data.type === "comparison" && data.document_ids) {
@@ -119,12 +171,191 @@ export default function ChatSessionPage() {
     fetchSession();
   }, [sessionId, user, router]);
 
+  // WebSocket connection for document processing status
+  useEffect(() => {
+    if (!docId) return;
+    
+    const connectWebSocket = () => {
+      const wsUrl = `${process.env.NEXT_PUBLIC_BACKEND_URL?.replace('http', 'ws')}/ws/${docId}`;
+      console.log('🔌 Connecting WebSocket to:', wsUrl);
+      console.log('📄 Document ID:', docId);
+      
+      const ws = new WebSocket(wsUrl);
+      
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          console.log('🔄 WebSocket message received:', data);
+          console.log('📊 Current document status:', documentStatus);
+          
+          if (data.type === 'status_update') {
+            // Update processing message first
+            if (data.message) {
+              setProcessingMessage(data.message);
+              console.log('💬 Updated processing message:', data.message);
+            }
+            
+            // Handle status changes
+            console.log('🎯 Checking status:', data.status);
+            
+            if (data.status === 'complete' || data.status === 'processed' || data.status === 'ready') {
+              console.log('✅ Document processing completed! Updating status to ready');
+              setDocumentStatus('ready');
+              setProcessingMessage('Document analysis complete! Ready for legal insights.');
+            } else if (data.status === 'error' || data.status === 'failed') {
+              console.log('❌ Document processing failed! Updating status to error');
+              setDocumentStatus('error');
+              setProcessingMessage('Error processing document. Please try again.');
+            } else if (data.status === 'processing' || data.status === 'analyzing') {
+              console.log('🔄 Document still processing...');
+              setDocumentStatus('processing');
+              // Keep the message from the server, or use default
+              if (!data.message) {
+                setProcessingMessage('Processing document...');
+              }
+            }
+          } else {
+            console.log('🔍 Non-status message:', data);
+          }
+        } catch (e) {
+          console.error('Error parsing WebSocket message:', e);
+        }
+      };
+      
+      ws.onopen = () => {
+        console.log('✅ WebSocket connected successfully for document:', docId);
+        console.log('🔗 WebSocket URL:', wsUrl);
+      };
+      
+      ws.onclose = (event) => {
+        console.log('❌ WebSocket disconnected:', event.code, event.reason);
+        console.log('🔄 Current document status during close:', documentStatus);
+        // Auto-retry connection after 3 seconds if document is still processing
+        if (documentStatus === 'processing') {
+          console.log('🔄 Will retry WebSocket connection in 3 seconds...');
+          setTimeout(connectWebSocket, 3000);
+        }
+      };
+      
+      ws.onerror = (error) => {
+        console.error('❌ WebSocket error:', error);
+        console.log('🔗 Failed WebSocket URL:', wsUrl);
+      };
+      
+      return ws;
+    };
+    
+    const ws = connectWebSocket();
+    
+    return () => {
+      ws.close();
+    };
+  }, [docId, documentStatus]);
+
+  // Backup polling mechanism in case WebSocket fails
+  useEffect(() => {
+    if (!docId || documentStatus !== 'processing') return;
+    
+    const pollInterval = setInterval(() => {
+      console.log('🔄 Polling document status as backup...');
+      checkDocumentStatus(docId);
+    }, 5000); // Poll every 5 seconds
+    
+    return () => clearInterval(pollInterval);
+  }, [docId, documentStatus, user]);
+
+  // Debug document status changes
+  useEffect(() => {
+    console.log('📊 Document status changed to:', documentStatus);
+    console.log('💬 Processing message:', processingMessage);
+  }, [documentStatus, processingMessage]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, streamingMessage]);
 
   const handleSignIn = async () => {
     await signInWithPopup(auth, new GoogleAuthProvider());
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() || !docId || !user || isStreaming) return;
+    
+    const messageText = input.trim();
+    setInput("");
+    setIsStreaming(true);
+    setStreamingMessage("");
+    
+    // Add user message immediately
+    const userMessage = { role: "user", text: messageText };
+    setMessages(prev => [...prev, userMessage]);
+    
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/session/${sessionId}/message/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ text: messageText }),
+      });
+      
+      if (!response.ok) throw new Error('Streaming failed');
+      
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No reader available');
+      
+      const decoder = new TextDecoder();
+      let buffer = '';
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'ai_chunk') {
+                setStreamingMessage(data.accumulated);
+              } else if (data.type === 'complete') {
+                // Add final AI message
+                setMessages(prev => [...prev, data.ai_message]);
+                setStreamingMessage("");
+                // Update session if provided
+                if (data.session) {
+                  setSession(data.session);
+                }
+              } else if (data.type === 'error') {
+                console.error('Streaming error:', data.error);
+                setMessages(prev => [...prev, { 
+                  role: "ai", 
+                  text: "Sorry, I encountered an error processing your request." 
+                }]);
+                setStreamingMessage("");
+              }
+            } catch (e) {
+              console.error('Error parsing stream data:', e);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error sending message:', error);
+      setMessages(prev => [...prev, { 
+        role: "ai", 
+        text: "Sorry, I encountered an error processing your request." 
+      }]);
+      setStreamingMessage("");
+    } finally {
+      setIsStreaming(false);
+    }
   };
 
   const handleSignOut = async () => {
@@ -224,7 +455,7 @@ export default function ChatSessionPage() {
   };
 
   const handleSummarize = async () => {
-    if (!docId || !user) return;
+    if (!docId || !user || documentStatus !== 'ready') return;
     
     setSummaryLoading(true);
     try {
@@ -325,7 +556,7 @@ export default function ChatSessionPage() {
 
   // Generate legal analysis artifact
   const handleGenerateAnalysis = async () => {
-    if (!docId || !user) return;
+    if (!docId || !user || documentStatus !== 'ready') return;
     
     setLoading(true);
     try {
@@ -540,48 +771,6 @@ export default function ChatSessionPage() {
     setSidebarCollapsed(prev => !prev);
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || !sessionId || !user) return;
-    
-    const messageText = input.trim();
-    setLoading(true);
-    setMessages((msgs) => [...msgs, { role: "user", text: messageText }]);
-    setInput("");
-    
-    try {
-      const idToken = await user.getIdToken();
-      const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/session/${sessionId}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
-        body: JSON.stringify({ text: messageText }),
-      });
-      
-      if (res.ok) {
-        const data = await res.json();
-        
-        // Update session title if this is the first message
-        if (messages.length === 0 && data.session) {
-          setSession(data.session);
-        }
-        
-        // Add AI response
-        const aiMessages = data.messages?.filter((m: any) => m.role === "ai") || [];
-        if (aiMessages.length > 0) {
-          setMessages((msgs) => [...msgs, ...aiMessages]);
-        } else {
-          setMessages((msgs) => [...msgs, { role: "ai", text: "I received your message but couldn't generate a response." }]);
-        }
-      } else {
-        setMessages((msgs) => [...msgs, { role: "ai", text: "Error: Could not get response from server." }]);
-      }
-    } catch (e) {
-      console.error("Error sending message:", e);
-      setMessages((msgs) => [...msgs, { role: "ai", text: "Error: Could not send message." }]);
-    }
-    
-    setLoading(false);
-  };
-
   if (!user) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50">
@@ -645,26 +834,35 @@ export default function ChatSessionPage() {
           </span>
           <div className="flex items-center gap-3">
             {/* Demo button for testing */}
-            {!showComparison && (
+            {/* {!showComparison && (
               <button
                 onClick={handleGenerateDemo}
                 className="btn btn-secondary flex items-center gap-2 text-xs"
               >
                 🧪 Demo Analysis
               </button>
-            )}
+            )} */}
             
             {/* Generate Analysis button - only for single documents */}
             {docId && !showComparison && (
               <button
                 onClick={handleGenerateAnalysis}
-                disabled={loading}
-                className="btn btn-primary flex items-center gap-2"
+                disabled={loading || documentStatus !== 'ready'}
+                className="btn btn-primary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {loading ? (
                   <>
                     <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
                     Analyzing...
+                  </>
+                ) : documentStatus === 'processing' ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                    Processing Document...
+                  </>
+                ) : documentStatus === 'error' ? (
+                  <>
+                    ❌ Document Error
                   </>
                 ) : (
                   <>
@@ -678,13 +876,22 @@ export default function ChatSessionPage() {
             {docId && !showComparison && (
               <button
                 onClick={handleSummarize}
-                disabled={summaryLoading}
-                className="btn btn-outline flex items-center gap-2"
+                disabled={summaryLoading || documentStatus !== 'ready'}
+                className="btn btn-outline flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {summaryLoading ? (
                   <>
                     <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                     Loading...
+                  </>
+                ) : documentStatus === 'processing' ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                    Processing Document...
+                  </>
+                ) : documentStatus === 'error' ? (
+                  <>
+                    ❌ Document Error
                   </>
                 ) : (
                   <>
@@ -785,8 +992,84 @@ export default function ChatSessionPage() {
                       ×
                     </button>
                   </div>
-                  <div className="text-blue-700 whitespace-pre-wrap text-sm leading-relaxed">
-                    {summary}
+                  <div className="text-blue-700 text-sm leading-relaxed prose prose-sm max-w-none prose-headings:text-blue-800 prose-headings:font-semibold prose-strong:text-blue-900 prose-strong:font-semibold">
+                    <ReactMarkdown 
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        // Custom styling for headers with blue theme
+                        h1: ({ children }) => <h1 className="text-lg font-bold text-blue-800 mb-2 border-b border-blue-200 pb-1">{children}</h1>,
+                        h2: ({ children }) => <h2 className="text-base font-semibold text-blue-800 mb-2 mt-3">{children}</h2>,
+                        h3: ({ children }) => <h3 className="text-sm font-semibold text-blue-700 mb-1 mt-2">{children}</h3>,
+                        
+                        // Enhanced lists with better spacing and blue icons
+                        ul: ({ children }) => <ul className="space-y-1 my-2">{children}</ul>,
+                        ol: ({ children }) => <ol className="space-y-1 my-2">{children}</ol>,
+                        li: ({ children }) => <li className="flex items-start gap-2"><span className="text-blue-500 mt-1 text-xs">•</span><span className="flex-1">{children}</span></li>,
+                        
+                        // Code styling with blue theme
+                        code: ({ children, ...props }) => {
+                          const isInline = !props.className?.includes('language-');
+                          return isInline ? 
+                            <code className="bg-blue-100 text-blue-800 px-1 py-0.5 rounded text-xs font-mono">{children}</code> :
+                            <code className="block bg-blue-50 text-blue-800 p-2 rounded text-xs font-mono whitespace-pre-wrap">{children}</code>;
+                        },
+                        
+                        // Enhanced strong/bold text with blue theme
+                        strong: ({ children }) => <strong className="font-semibold text-blue-900 bg-blue-100 px-1 py-0.5 rounded">{children}</strong>,
+                        
+                        // Better paragraph spacing
+                        p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed text-blue-700">{children}</p>,
+                        
+                        // Blockquote styling with blue theme
+                        blockquote: ({ children }) => <blockquote className="border-l-4 border-blue-300 pl-3 py-1 bg-blue-100 my-2 italic text-blue-800">{children}</blockquote>
+                      }}
+                    >
+                      {summary}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              )}
+              
+              {/* Document processing status indicator */}
+              {docId && documentStatus === 'processing' && (
+                <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="w-5 h-5 border-2 border-yellow-500 border-t-transparent rounded-full animate-spin"></div>
+                    <div>
+                      <h3 className="font-semibold text-yellow-800">Processing Document</h3>
+                      <p className="text-yellow-700 text-sm">
+                        {processingMessage || 'Analyzing your document... This may take a few moments.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Document error status indicator */}
+              {docId && documentStatus === 'error' && (
+                <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="text-red-500 text-xl">❌</div>
+                    <div>
+                      <h3 className="font-semibold text-red-800">Document Processing Error</h3>
+                      <p className="text-red-700 text-sm">
+                        {processingMessage || 'There was an error processing your document. Please try uploading again.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Document ready status (subtle) */}
+              {docId && documentStatus === 'ready' && messages.length === 0 && (
+                <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="text-green-500 text-lg">✅</div>
+                    <div>
+                      <p className="text-green-700 text-sm">
+                        Document analysis complete! Ready for legal insights. Use the buttons above to get started.
+                      </p>
+                    </div>
                   </div>
                 </div>
               )}
@@ -803,9 +1086,117 @@ export default function ChatSessionPage() {
                     msg.role === "user" ? "bubble-user ml-auto" : "bubble-ai mr-auto"
                   }`}
                 >
-                  {msg.text}
+                  {msg.role === "user" ? (
+                    msg.text
+                  ) : (
+                    <div className="prose prose-sm max-w-none prose-headings:text-gray-800 prose-headings:font-semibold prose-strong:text-gray-900 prose-strong:font-semibold">
+                      <ReactMarkdown 
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          // Custom styling for headers
+                          h1: ({ children }) => <h1 className="text-lg font-bold text-gray-800 mb-2 border-b border-gray-200 pb-1">{children}</h1>,
+                          h2: ({ children }) => <h2 className="text-base font-semibold text-gray-800 mb-2 mt-3">{children}</h2>,
+                          h3: ({ children }) => <h3 className="text-sm font-semibold text-gray-700 mb-1 mt-2">{children}</h3>,
+                          
+                          // Enhanced lists with better spacing and icons
+                          ul: ({ children }) => <ul className="space-y-1 my-2">{children}</ul>,
+                          ol: ({ children }) => <ol className="space-y-1 my-2">{children}</ol>,
+                          li: ({ children }) => <li className="flex items-start gap-2"><span className="text-blue-500 mt-1 text-xs">•</span><span className="flex-1">{children}</span></li>,
+                          
+                          // Code styling
+                          code: ({ children, ...props }) => {
+                            const isInline = !props.className?.includes('language-');
+                            return isInline ? 
+                              <code className="bg-gray-100 text-gray-800 px-1 py-0.5 rounded text-xs font-mono">{children}</code> :
+                              <code className="block bg-gray-50 text-gray-800 p-2 rounded text-xs font-mono whitespace-pre-wrap">{children}</code>;
+                          },
+                          
+                          // Enhanced strong/bold text
+                          strong: ({ children }) => <strong className="font-semibold text-gray-900 bg-yellow-50 px-1 py-0.5 rounded">{children}</strong>,
+                          
+                          // Better paragraph spacing
+                          p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+                          
+                          // Table styling (if needed)
+                          table: ({ children }) => <table className="min-w-full border-collapse border border-gray-200 my-2">{children}</table>,
+                          th: ({ children }) => <th className="border border-gray-200 px-2 py-1 bg-gray-50 font-semibold text-xs">{children}</th>,
+                          td: ({ children }) => <td className="border border-gray-200 px-2 py-1 text-xs">{children}</td>,
+                          
+                          // Blockquote styling
+                          blockquote: ({ children }) => <blockquote className="border-l-4 border-blue-200 pl-3 py-1 bg-blue-50 my-2 italic text-gray-700">{children}</blockquote>
+                        }}
+                      >
+                        {msg.text}
+                      </ReactMarkdown>
+                    </div>
+                  )}
                 </div>
               ))}
+              
+              {/* Streaming message */}
+              {isStreaming && streamingMessage && (
+                <div className="bubble bubble-ai mr-auto">
+                  <div className="prose prose-sm max-w-none prose-headings:text-gray-800 prose-headings:font-semibold prose-strong:text-gray-900 prose-strong:font-semibold">
+                    <ReactMarkdown 
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        // Custom styling for headers
+                        h1: ({ children }) => <h1 className="text-lg font-bold text-gray-800 mb-2 border-b border-gray-200 pb-1">{children}</h1>,
+                        h2: ({ children }) => <h2 className="text-base font-semibold text-gray-800 mb-2 mt-3">{children}</h2>,
+                        h3: ({ children }) => <h3 className="text-sm font-semibold text-gray-700 mb-1 mt-2">{children}</h3>,
+                        
+                        // Enhanced lists with better spacing and icons
+                        ul: ({ children }) => <ul className="space-y-1 my-2">{children}</ul>,
+                        ol: ({ children }) => <ol className="space-y-1 my-2">{children}</ol>,
+                        li: ({ children }) => <li className="flex items-start gap-2"><span className="text-blue-500 mt-1 text-xs">•</span><span className="flex-1">{children}</span></li>,
+                        
+                        // Code styling
+                        code: ({ children, ...props }) => {
+                          const isInline = !props.className?.includes('language-');
+                          return isInline ? 
+                            <code className="bg-gray-100 text-gray-800 px-1 py-0.5 rounded text-xs font-mono">{children}</code> :
+                            <code className="block bg-gray-50 text-gray-800 p-2 rounded text-xs font-mono whitespace-pre-wrap">{children}</code>;
+                        },
+                        
+                        // Enhanced strong/bold text
+                        strong: ({ children }) => <strong className="font-semibold text-gray-900 bg-yellow-50 px-1 py-0.5 rounded">{children}</strong>,
+                        
+                        // Better paragraph spacing
+                        p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+                        
+                        // Table styling (if needed)
+                        table: ({ children }) => <table className="min-w-full border-collapse border border-gray-200 my-2">{children}</table>,
+                        th: ({ children }) => <th className="border border-gray-200 px-2 py-1 bg-gray-50 font-semibold text-xs">{children}</th>,
+                        td: ({ children }) => <td className="border border-gray-200 px-2 py-1 text-xs">{children}</td>,
+                        
+                        // Blockquote styling
+                        blockquote: ({ children }) => <blockquote className="border-l-4 border-blue-200 pl-3 py-1 bg-blue-50 my-2 italic text-gray-700">{children}</blockquote>
+                      }}
+                    >
+                      {streamingMessage}
+                    </ReactMarkdown>
+                  </div>
+                  <div className="text-xs text-gray-500 mt-2 flex items-center gap-1">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                    Typing...
+                  </div>
+                </div>
+              )}
+              
+              {/* Streaming indicator without message */}
+              {isStreaming && !streamingMessage && (
+                <div className="bubble bubble-ai mr-auto">
+                  <div className="flex items-center gap-2 text-gray-500">
+                    <div className="flex gap-1">
+                      <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"></div>
+                      <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></div>
+                      <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
+                    </div>
+                    AI is thinking...
+                  </div>
+                </div>
+              )}
+              
               <div ref={messagesEndRef} />
             </div>
 
@@ -819,7 +1210,7 @@ export default function ChatSessionPage() {
                   docId ? "Ask a question about the document..." : "Upload a document to start..."
                 }
                 className="flex-1 input"
-                disabled={!docId || loading}
+                disabled={!docId || loading || isStreaming}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -829,10 +1220,10 @@ export default function ChatSessionPage() {
               />
               <button
                 onClick={handleSend}
-                disabled={!docId || !input.trim() || loading}
+                disabled={!docId || !input.trim() || loading || isStreaming}
                 className="btn btn-primary"
               >
-                {loading ? "Sending..." : "Send"}
+                {isStreaming ? "AI is typing..." : loading ? "Sending..." : "Send"}
               </button>
             </div>
         </div>

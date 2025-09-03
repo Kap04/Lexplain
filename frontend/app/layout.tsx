@@ -1,6 +1,7 @@
 import './globals.css';
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
+import { AuthProvider } from '@/contexts/AuthContext';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -13,11 +14,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className={inter.className}>
-        <main>{children}</main>
-        {/* <footer style={{textAlign:'center',marginTop:32,fontSize:12}}>
-          <hr />
-          <div style={{color:'#888'}}>This tool provides informational summaries only, not legal advice.</div>
-        </footer> */}
+        <AuthProvider>
+          <main>{children}</main>
+        </AuthProvider>
+        
       </body>
     </html>
   );

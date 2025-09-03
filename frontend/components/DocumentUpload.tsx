@@ -13,6 +13,7 @@ interface UploadedDocument {
   name: string;
   status: 'uploading' | 'processing' | 'ready' | 'error';
   error?: string;
+  extractionMethod?: string;
 }
 
 interface DocumentUploadProps {
@@ -49,6 +50,19 @@ export default function DocumentUpload({ onUpload, onComparisonReady, user }: Do
     multiple: compareMode,
     maxFiles: compareMode ? 5 : 1,
   });
+
+  const getExtractionMethodDisplay = (method?: string) => {
+    if (!method) return null;
+    
+    switch (method) {
+      case 'text_based':
+        return { label: 'Text', icon: '📄', color: 'text-green-600 bg-green-50' };
+      case 'plain_text_fallback':
+        return { label: 'Plain Text', icon: '📝', color: 'text-gray-600 bg-gray-50' };
+      default:
+        return { label: 'Processed', icon: '✓', color: 'text-gray-600 bg-gray-50' };
+    }
+  };
 
   const removeFile = (index: number) => {
     setFiles(prev => prev.filter((_, i) => i !== index));
@@ -107,8 +121,11 @@ export default function DocumentUpload({ onUpload, onComparisonReady, user }: Do
     });
 
     if (!res.ok) throw new Error("Upload failed");
-    const { document_id } = await res.json();
-    return document_id;
+    const { document_id, extraction_method } = await res.json();
+    return { 
+      id: document_id, 
+      extractionMethod: extraction_method || 'text_based' 
+    };
   };
 
   const handleUpload = async () => {
@@ -126,13 +143,14 @@ export default function DocumentUpload({ onUpload, onComparisonReady, user }: Do
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
           try {
-            const docId = await uploadSingleFile(file);
+            const uploadResult = await uploadSingleFile(file);
             uploadedDocs.push({
-              id: docId,
+              id: uploadResult.id,
               name: file.name,
-              status: 'processing'
+              status: 'processing',
+              extractionMethod: uploadResult.extractionMethod
             });
-            successfulDocIds.push(docId);
+            successfulDocIds.push(uploadResult.id);
           } catch (error) {
             console.error(`Error uploading ${file.name}:`, error);
             uploadedDocs.push({
@@ -162,19 +180,20 @@ export default function DocumentUpload({ onUpload, onComparisonReady, user }: Do
         
       } else {
         // Single file upload
-        const docId = await uploadSingleFile(files[0]);
+        const uploadResult = await uploadSingleFile(files[0]);
         setFiles([]);
         
         // Set up document tracking for WebSocket status
         setDocuments([{
-          id: docId,
+          id: uploadResult.id,
           name: files[0].name,
-          status: 'processing'
+          status: 'processing',
+          extractionMethod: uploadResult.extractionMethod
         }]);
         
         // Let WebSocket handle status updates, and navigate when ready
         setTimeout(() => {
-          onUpload(docId);
+          onUpload(uploadResult.id);
         }, 1000); // Give WebSocket time to connect
       }
     } catch (error) {
@@ -360,6 +379,7 @@ export default function DocumentUpload({ onUpload, onComparisonReady, user }: Do
               docId={doc.id}
               fileName={doc.name}
               onReady={handleDocumentReady}
+              extractionMethod={doc.extractionMethod}
             />
           ))}
         </div>
