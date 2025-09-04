@@ -273,67 +273,67 @@ def truncate_content_for_firestore(content: str, max_bytes: int = 900000) -> str
     
     return truncated_content
 
-def extract_text_with_ocr_support(content, filename: str = "document.pdf") -> tuple[str, str]:
-    """
-    Extract text from PDF with OCR fallback support
+# def extract_text_with_ocr_support(content, filename: str = "document.pdf") -> tuple[str, str]:
+#     """
+#     Extract text from PDF with OCR fallback support
     
-    Returns:
-        tuple: (extracted_text, extraction_method)
-    """
-    try:
-        # First, try the existing method
-        pages = extract_pages_from_pdf_content(content)
-        extracted_text = "\n\n".join(page["text"] for page in pages)
+#     Returns:
+#         tuple: (extracted_text, extraction_method)
+#     """
+#     try:
+#         # First, try the existing method
+#         pages = extract_pages_from_pdf_content(content)
+#         extracted_text = "\n\n".join(page["text"] for page in pages)
         
-        # Check if we got meaningful text
-        text_quality = len(extracted_text.strip().replace('\n', '').replace(' ', ''))
+#         # Check if we got meaningful text
+#         text_quality = len(extracted_text.strip().replace('\n', '').replace(' ', ''))
         
-        if text_quality > 100:  # Good text extraction
-            print(f"✅ Text-based extraction successful: {text_quality} characters")
-            return extracted_text, "text_based"
-        else:
-            print(f"⚠️ Poor text extraction ({text_quality} chars), trying OCR...")
-            # Fallback to OCR
-            return _extract_with_ocr_fallback(content, filename)
+#         if text_quality > 100:  # Good text extraction
+#             print(f"✅ Text-based extraction successful: {text_quality} characters")
+#             return extracted_text, "text_based"
+#         else:
+#             print(f"⚠️ Poor text extraction ({text_quality} chars), trying OCR...")
+#             # Fallback to OCR
+#             return _extract_with_ocr_fallback(content, filename)
             
-    except Exception as e:
-        print(f"❌ Text-based extraction failed: {e}, trying OCR...")
-        # Fallback to OCR
-        return _extract_with_ocr_fallback(content, filename)
+    # except Exception as e:
+    #     print(f"❌ Text-based extraction failed: {e}, trying OCR...")
+    #     # Fallback to OCR
+    #     return _extract_with_ocr_fallback(content, filename)
 
-def _extract_with_ocr_fallback(content, filename: str) -> tuple[str, str]:
-    """
-    Extract text using OCR as fallback
-    """
-    try:
-        # Import OCR processor
-        from ocr_processor import extract_text_with_ocr
+# def _extract_with_ocr_fallback(content, filename: str) -> tuple[str, str]:
+#     """
+#     Extract text using OCR as fallback
+#     """
+#     try:
+#         # Import OCR processor
+#         #from ocr_processor import extract_text_with_ocr
         
-        # Save content to temporary file for OCR processing
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            temp_file.write(content)
-            temp_path = temp_file.name
+#         # Save content to temporary file for OCR processing
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+#             temp_file.write(content)
+#             temp_path = temp_file.name
         
-        try:
-            # Use OCR processor
-            extracted_text, method = extract_text_with_ocr(temp_path)
-            print(f"✅ OCR extraction successful: {len(extracted_text)} characters using {method}")
-            return extracted_text, f"ocr_{method}"
-        finally:
-            # Clean up temp file
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
+#         try:
+#             # Use OCR processor
+#             extracted_text, method = extract_text_with_ocr(temp_path)
+#             print(f"✅ OCR extraction successful: {len(extracted_text)} characters using {method}")
+#             return extracted_text, f"ocr_{method}"
+#         finally:
+#             # Clean up temp file
+#             try:
+#                 os.unlink(temp_path)
+#             except:
+#                 pass
                 
-    except Exception as e:
-        print(f"❌ OCR extraction also failed: {e}")
-        # Last resort: return as plain text
-        try:
-            text = content.decode('utf-8', errors='ignore')
-            return text, "plain_text_fallback"
-        except:
-            return "Could not extract text from document", "extraction_failed"
+#     except Exception as e:
+#         print(f"❌ OCR extraction also failed: {e}")
+#         # Last resort: return as plain text
+#         try:
+#             text = content.decode('utf-8', errors='ignore')
+#             return text, "plain_text_fallback"
+#         except:
+#             return "Could not extract text from document", "extraction_failed"
 
 
 def _create_combined_summary(summary_data: Dict[str, Any]) -> str:
@@ -380,51 +380,51 @@ def _clean_message_for_response(message: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-@app.post("/api/upload/content")
-async def upload_document_content(
-    file: UploadFile = File(...),
-    user=Depends(verify_firebase_token)
-):
-    print(f"Uploading document: {file.filename} for user: {user['uid']}")
-    content = await file.read()
+# @app.post("/api/upload/content")
+# async def upload_document_content(
+#     file: UploadFile = File(...),
+#     user=Depends(verify_firebase_token)
+# ):
+#     print(f"Uploading document: {file.filename} for user: {user['uid']}")
+#     content = await file.read()
     
-    try:
-        # Use OCR-aware text extraction
-        extracted_text, extraction_method = extract_text_with_ocr_support(content, file.filename)
+#     try:
+#         # Use OCR-aware text extraction
+#         extracted_text, extraction_method = extract_text_with_ocr_support(content, file.filename)
         
-        # Truncate content if too large for Firestore
-        original_length = len(extracted_text)
-        extracted_text = truncate_content_for_firestore(extracted_text)
+#         # Truncate content if too large for Firestore
+#         original_length = len(extracted_text)
+#         extracted_text = truncate_content_for_firestore(extracted_text)
         
-        if len(extracted_text) < original_length:
-            print(f"⚠️ Content truncated from {original_length} to {len(extracted_text)} characters for Firestore storage")
+#         if len(extracted_text) < original_length:
+#             print(f"⚠️ Content truncated from {original_length} to {len(extracted_text)} characters for Firestore storage")
         
-        print(f"✅ Text extraction successful using {extraction_method}. Preview: {extracted_text[:200]}")
-    except Exception as e:
-        print(f"❌ All text extraction methods failed: {e}. Using fallback.")
-        extracted_text = "Error: Could not extract text from document"
-        extraction_method = "extraction_failed"
+#         print(f"✅ Text extraction successful using {extraction_method}. Preview: {extracted_text[:200]}")
+#     except Exception as e:
+#         print(f"❌ All text extraction methods failed: {e}. Using fallback.")
+#         extracted_text = "Error: Could not extract text from document"
+#         extraction_method = "extraction_failed"
 
-    doc = {
-        "ownerId": user["uid"],
-        "filename": file.filename,
-        "status": "uploaded",
-        "createdAt": firestore.SERVER_TIMESTAMP,
-        "documentContent": extracted_text,
-        "extractionMethod": extraction_method,  # Track how text was extracted
-    }
-    doc_id = add_document_metadata(db, doc)  # Pass db
-    print(f"Document stored with ID: {doc_id}")
+#     doc = {
+#         "ownerId": user["uid"],
+#         "filename": file.filename,
+#         "status": "uploaded",
+#         "createdAt": firestore.SERVER_TIMESTAMP,
+#         "documentContent": extracted_text,
+#         "extractionMethod": extraction_method,  # Track how text was extracted
+#     }
+#     doc_id = add_document_metadata(db, doc)  # Pass db
+#     print(f"Document stored with ID: {doc_id}")
 
-    # --- Start processing in background so embeddings are created immediately ---
-    try:
-        t = threading.Thread(target=_process_document_sync, args=(doc_id, user["uid"]), daemon=True)
-        t.start()
-        print(f"Background processing thread started for {doc_id}")
-    except Exception as e:
-        print(f"Failed to start background thread for processing: {e}")
+#     # --- Start processing in background so embeddings are created immediately ---
+#     try:
+#         t = threading.Thread(target=_process_document_sync, args=(doc_id, user["uid"]), daemon=True)
+#         t.start()
+#         print(f"Background processing thread started for {doc_id}")
+#     except Exception as e:
+#         print(f"Failed to start background thread for processing: {e}")
 
-    return {"document_id": doc_id, "status": "uploaded", "extraction_method": extraction_method}
+#     return {"document_id": doc_id, "status": "uploaded", "extraction_method": extraction_method}
 
 
 
@@ -434,7 +434,7 @@ def _process_document_sync(document_id: str, owner_uid: str):
        Can be called directly (synchronously) or from a background thread.
     """
     def send_status_update(status: str, message: str = ""):
-        """Send status update via WebSocket (sync wrapper)"""
+        """Send status update via WebSocket (syncwrapper)"""
         try:
             import asyncio
             try:

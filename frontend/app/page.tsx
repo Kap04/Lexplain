@@ -14,8 +14,8 @@ export default function Home() {
 
         {/* Text Section */}
         <div className="max-w-2xl col-span-1 flex flex-col justify-center h-full">
-          <h1 className="text-7xl font-bold text-gray-900 leading-tight">
-            <HyperText duration={1000} className="text-7xl font-bold">
+          <h1 className="text-6xl font-bold text-gray-900 leading-tight">
+            <HyperText duration={1000} className="text-8xl text-yellow-800 font-extrabold">
               Demystrify
             </HyperText>
             {" "}Legal Documents with <SparklesText className="text-[#7C3AED]">AI</SparklesText>
@@ -56,6 +56,3 @@ export default function Home() {
     </div>
   );
 }
-
-
-//Interactive hover button from magicUi
