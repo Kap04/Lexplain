@@ -79,10 +79,10 @@ if not _API_KEY:
 # Initialize modern client
 client = genai.Client(api_key=_API_KEY)
 
-# --- Rate limiter with better quota handling ---
-_RPM = int(os.getenv("GEMINI_EMBEDDING_RPM", 5))  # Reduced from 100
-_TPM = int(os.getenv("GEMINI_EMBEDDING_TPM", 500))  # Reduced from 30000
-_RPD = int(os.getenv("GEMINI_EMBEDDING_RPD", 100))   # Reduced from 1000
+# --- Rate limiter with much more aggressive settings for better UX ---
+_RPM = int(os.getenv("GEMINI_EMBEDDING_RPM", 30))  # More aggressive: 30 RPM
+_TPM = int(os.getenv("GEMINI_EMBEDDING_TPM", 5000))  # More aggressive: 5000 TPM
+_RPD = int(os.getenv("GEMINI_EMBEDDING_RPD", 1000))   # More aggressive: 1000 RPD
 
 
 def _pt_date_now():
@@ -210,15 +210,79 @@ class RateLimiter:
                     self.daily_count += 1
                     return
                 
-                # Longer sleep with more jitter for Railway
-                sleep_for = wait + random.uniform(1, 3)  # 1-3 seconds additional jitter
+                # Optimized sleep with reduced jitter for better performance
+                sleep_for = wait + random.uniform(0.1, 0.5)  # Reduced from 1-3 seconds to 0.1-0.5 seconds
             
             print(f"RateLimiter sleeping for {sleep_for:.2f}s to respect Gemini RPM/TPM limits")
             time.sleep(sleep_for)
 
 
-# Module-level rate limiter
-_RATE_LIMITER = RateLimiter()
+class SimpleRateLimiter:
+    """Simplified, much more aggressive rate limiter for better user experience"""
+    def __init__(self, rpm=_RPM, tpm=_TPM, rpd=_RPD):
+        self.rpm = rpm
+        self.tpm = tpm
+        self.rpd = rpd
+        self.request_times = []
+        self.token_usage = []
+        self.daily_count = 0
+        self.last_reset_date = _pt_date_now()
+        self.lock = threading.Lock()
+        
+        # Much more aggressive timing - only wait when absolutely necessary
+        self.min_interval = max(0.5, 60.0 / rpm) if rpm > 0 else 0.5  # At least 0.5s, max based on RPM
+        print(f"🚀 Aggressive rate limiter: {rpm} RPM (min interval: {self.min_interval:.2f}s)")
+
+    def _reset_daily_if_needed(self):
+        today = _pt_date_now()
+        if today != self.last_reset_date:
+            self.daily_count = 0
+            self.last_reset_date = today
+            print(f"📅 Daily counter reset for {today}")
+
+    def acquire(self, estimated_tokens: int):
+        with self.lock:
+            now = time.time()
+            self._reset_daily_if_needed()
+            
+            # Check daily limit
+            if self.daily_count >= self.rpd:
+                raise RuntimeError("Daily requests quota reached for Gemini embeddings")
+            
+            # Clean old entries (only keep last 60 seconds)
+            cutoff = now - 60
+            self.request_times = [t for t in self.request_times if t > cutoff]
+            self.token_usage = [(t, tokens) for t, tokens in self.token_usage if t > cutoff]
+            
+            # Minimal RPM check - just ensure reasonable spacing
+            if self.request_times:
+                time_since_last = now - self.request_times[-1]
+                if time_since_last < self.min_interval:
+                    wait_time = self.min_interval - time_since_last
+                    if wait_time > 0.1:  # Only log if meaningful wait
+                        print(f"⏱️  Brief wait: {wait_time:.1f}s for spacing")
+                    time.sleep(wait_time)
+                    now = time.time()  # Update now after sleep
+            
+            # Very relaxed TPM check - only block if way over limit
+            current_tokens = sum(tokens for _, tokens in self.token_usage)
+            if current_tokens + estimated_tokens > self.tpm * 1.5:  # 50% buffer before blocking
+                wait_time = self.min_interval  # Just wait the minimum interval
+                print(f"🔄 Token limit brief wait: {wait_time:.1f}s")
+                time.sleep(wait_time)
+                now = time.time()
+            
+            # Record this request
+            self.request_times.append(now)
+            self.token_usage.append((now, estimated_tokens))
+            self.daily_count += 1
+            
+    def is_quota_available(self):
+        return True  # Always optimistic for better UX
+
+
+# Module-level rate limiter with simplified implementation
+_RATE_LIMITER = SimpleRateLimiter()
 
 # Per-process concurrency cap
 _MAX_CONCURRENCY = int(os.getenv("GEMINI_EMBEDDING_CONCURRENCY", 1))  # Reduced from 2
@@ -510,7 +574,7 @@ def debug_simple_embedding_test():
 # debug_simple_embedding_test()
 # 2. In your embed_texts function, add delays between batches:
 
-def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
+def embed_texts(texts: List[str], max_batch_tokens: int = 3000) -> List[list]:
     """Embed multiple text strings, splitting into batches by token count."""
     if not texts:
         return []
@@ -532,19 +596,19 @@ def embed_texts(texts: List[str], max_batch_tokens: int = 1000) -> List[list]:
     if current_batch:
         batches.append(current_batch)
     
-    print(f"Processing {len(batches)} batches of embeddings")
+    print(f"Processing {len(batches)} batches of embeddings (increased batch size)")
     
     all_embeddings = []
     for i, batch in enumerate(batches):
-        print(f"Processing batch {i+1}/{len(batches)}")
+        print(f"Processing batch {i+1}/{len(batches)} with {len(batch)} texts")
         
         batch_embeddings = _embed_single_batch(batch)
         all_embeddings.extend(batch_embeddings)
         
-        # Add delay between batches (except after the last one)
+        # Minimal delay between batches (except after the last one) 
         if i < len(batches) - 1:
-            sleep_time = 1.5  # 1.5 seconds between batches
-            print(f"Waiting {sleep_time}s before next batch...")
+            sleep_time = 0.3  # Reduced from 1.5s to 0.3s for much better performance
+            print(f"Brief pause {sleep_time}s before next batch...")
             time.sleep(sleep_time)
     
     return all_embeddings

@@ -175,7 +175,7 @@ export default function ChatPage() {
             <div className="flex-1 flex flex-col items-center justify-center p-8 max-w-2xl mx-auto w-full">
               {/* Greeting */}
               <h1 className="text-5xl font-bold text-gray-800 mb-8">
-                {getGreeting()}, {user.displayName?.split(' ')[0] || 'there'}!
+                {getGreeting()}, <span className="text-blue-900 font-bold">{user.displayName?.split(' ')[0] || 'there'}!</span>
               </h1>
               
               {/* Document Upload Component */}

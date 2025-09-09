@@ -24,9 +24,7 @@ export default function Home() {
             Upload contracts, rental agreements, or terms of service and get
             simple plain-English summaries. Ask questions, clarify clauses,
             and make informed decisions.{" "}
-            <span className="font-semibold text-gray-900">
-              This is not legal advice.
-            </span>
+            
           </p>
           <div className="flex justify-end md:justify-end pr-20">
             <Link href="/auth">

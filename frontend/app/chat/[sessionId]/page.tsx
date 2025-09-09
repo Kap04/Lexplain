@@ -55,6 +55,10 @@ export default function ChatSessionPage() {
   const [documentStatus, setDocumentStatus] = useState<'processing' | 'ready' | 'error'>('processing');
   const [processingMessage, setProcessingMessage] = useState('Starting document analysis...');
   
+  // Comparison processing status
+  const [comparisonStatus, setComparisonStatus] = useState<'processing' | 'ready' | 'error'>('processing');
+  const [comparisonMessage, setComparisonMessage] = useState('Preparing document comparison...');
+  
   // Streaming state
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingMessage, setStreamingMessage] = useState('');
@@ -153,6 +157,10 @@ export default function ChatSessionPage() {
           if (data.type === "comparison" && data.document_ids) {
             setComparisonDocuments(data.document_ids);
             setShowComparison(true);
+            
+            // Initialize comparison status
+            setComparisonStatus('processing');
+            setComparisonMessage(`Preparing to compare ${data.document_ids.length} documents...`);
             
             // Generate comparison artifact immediately
             generateComparisonArtifact(data.document_ids);
@@ -483,7 +491,10 @@ export default function ChatSessionPage() {
   const generateComparisonArtifact = async (docIds: string[]) => {
     if (!user || docIds.length < 2) return;
     
+    setComparisonStatus('processing');
+    setComparisonMessage(`Starting comparison analysis for ${docIds.length} documents...`);
     setLoading(true);
+    
     try {
       const idToken = await user.getIdToken();
       const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/documents/compare`, {
@@ -501,6 +512,7 @@ export default function ChatSessionPage() {
         // Check if documents are still processing
         if (comparisonData.status === "processing") {
           console.log(`Documents still processing: ${comparisonData.message}`);
+          setComparisonMessage(`Documents still processing: ${comparisonData.message || 'Please wait...'}`);
           // Retry after a delay
           setTimeout(() => generateComparisonArtifact(docIds), 5000);
           return;
@@ -509,6 +521,7 @@ export default function ChatSessionPage() {
         // Check if we have a complete comparison (documents and comparison fields)
         if (!comparisonData.documents || !comparisonData.comparison) {
           console.log("Incomplete comparison data received, retrying...");
+          setComparisonMessage("Processing comparison analysis, please wait...");
           setTimeout(() => generateComparisonArtifact(docIds), 3000);
           return;
         }
@@ -530,20 +543,33 @@ export default function ChatSessionPage() {
         };
         
         setComparisonArtifacts(prev => [newComparisonArtifact, ...prev]);
+        setSelectedComparison(newComparisonArtifact);
+        setShowArtifactPanel(true);
+        
+        // Update status to complete
+        setComparisonStatus('ready');
+        setComparisonMessage(`✅ Comparison analysis complete! Found ${newComparisonArtifact.highRiskClauses} high-risk clauses and ${newComparisonArtifact.missingClauses} missing clauses.`);
         
       } else {
         const errorData = await res.json();
         console.error("Comparison API error:", errorData);
         if (errorData.detail?.includes("still processing")) {
+          setComparisonMessage("Documents are still being processed. Retrying in 5 seconds...");
           // Retry if documents are still processing
           setTimeout(() => generateComparisonArtifact(docIds), 5000);
           return;
         }
+        throw new Error(errorData.detail || "Failed to generate comparison");
       }
     } catch (error) {
       console.error("Error generating comparison artifact:", error);
-      // Retry on network errors
-      setTimeout(() => generateComparisonArtifact(docIds), 5000);
+      setComparisonStatus('error');
+      setComparisonMessage("❌ Failed to generate document comparison. Please try again.");
+      // Retry on network errors after longer delay
+      setTimeout(() => {
+        setComparisonMessage("Retrying comparison analysis...");
+        generateComparisonArtifact(docIds);
+      }, 10000);
     }
     setLoading(false);
   };
@@ -1068,6 +1094,50 @@ export default function ChatSessionPage() {
                     <div>
                       <p className="text-green-700 text-sm">
                         Document analysis complete! Ready for legal insights. Use the buttons above to get started.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Comparison processing status indicator */}
+              {showComparison && comparisonStatus === 'processing' && (
+                <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                    <div>
+                      <h3 className="font-semibold text-blue-800">Comparing Documents</h3>
+                      <p className="text-blue-700 text-sm">
+                        {comparisonMessage || 'Analyzing document differences and generating comparison insights...'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Comparison error status indicator */}
+              {showComparison && comparisonStatus === 'error' && (
+                <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="text-red-500 text-xl">❌</div>
+                    <div>
+                      <h3 className="font-semibold text-red-800">Comparison Error</h3>
+                      <p className="text-red-700 text-sm">
+                        {comparisonMessage || 'There was an error generating the document comparison. Please try again.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Comparison ready status */}
+              {showComparison && comparisonStatus === 'ready' && comparisonArtifacts.length > 0 && (
+                <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+                  <div className="flex items-center gap-3">
+                    <div className="text-green-500 text-lg">✅</div>
+                    <div>
+                      <p className="text-green-700 text-sm">
+                        {comparisonMessage || 'Document comparison complete! Check the insights panel for detailed analysis.'}
                       </p>
                     </div>
                   </div>
